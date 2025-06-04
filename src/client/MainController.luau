@@ -116,18 +116,31 @@ local function findPlayerDroneAndInitialize()
 		end)
 
         inputControllerRef.ReorientButtonPressed.Event:Connect(function()
-            if currentMode == MODE_PLAYER_CONTROL and MyDrone then
-                print("MainController: Reorient button pressed. Requesting server reorient.")
-                currentMode = MODE_REORIENTING 
-                local success, result = pcall(_Remotes.RequestReorient.InvokeServer, _Remotes.RequestReorient)
-                if not success or not result or not result.success then
-                    warn("MainController: Reorient request failed or server rejected.", result)
-                    currentMode = MODE_PLAYER_CONTROL 
-                else
-                    print("MainController: Reorient request accepted by server.")
-                end
+            if not MyDrone then
+                print("MainController: Reorient pressed but no drone.")
+                return
+            end
+
+            if currentMode == MODE_REORIENTING then
+                print("MainController: Reorient pressed but already in MODE_REORIENTING.")
+                return
+            end
+
+            print("MainController: Reorient button pressed. Current Mode:", currentMode, ". Attempting to switch to MODE_REORIENTING and invoke server.")
+            currentMode = MODE_REORIENTING
+            -- Clear any active trick ID on the client, as reorientation takes precedence.
+            -- The server will handle cancelling its own pending trick operations for this player.
+            if activeOriginalRequestId then
+                print("MainController: Reorient action is clearing activeOriginalRequestId:", activeOriginalRequestId)
+                activeOriginalRequestId = nil
+            end
+            
+            local success, result = pcall(_Remotes.RequestReorient.InvokeServer, _Remotes.RequestReorient)
+            if not success or not result or not result.success then
+                warn("MainController: Reorient request failed or server rejected. Reverting to PLAYER_CONTROL. Error:", result)
+                currentMode = MODE_PLAYER_CONTROL 
             else
-                print("MainController: Reorient pressed but not in PlayerControl mode or no drone.")
+                print("MainController: Reorient request accepted by server.")
             end
         end)
 
@@ -142,43 +155,50 @@ function MainController:Start(dependencies)
 	print("MainController: Start called for player", player.Name, ". All tricks server-authoritative.")
 
     _Remotes.ServerNotification.OnClientEvent:Connect(function(payload)
-        print("MainController: ServerNotification:", payload.type, "PayloadOrigID:", payload.original_request_id or "N/A", "ClientActiveID:", activeOriginalRequestId or "N/A")
+        print("MainController: ServerNotification Received:", payload.type, " | Current Client Mode:", currentMode, " | PayloadOrigID:", payload.original_request_id or "N/A", " | ClientActiveID:", activeOriginalRequestId or "N/A")
         
         if payload.type == "TrickAttempting" then
             if payload.original_request_id == activeOriginalRequestId then
                 print("MainController: Server is Attempting Trick for active request:", activeOriginalRequestId)
             else
-                 print("MainController: ServerNotification TrickAttempting for mismatched/old request ID. Current active:", activeOriginalRequestId)
+                 print("MainController: ServerNotification TrickAttempting for mismatched/old request ID. Current active:", activeOriginalRequestId, ". Ignoring.")
             end
         elseif payload.type == "TrickStarted" then
             if payload.original_request_id == activeOriginalRequestId and currentMode == MODE_AWAITING_TRICK_START then
                 currentMode = MODE_TRICK_IN_PROGRESS 
-                print("MainController: Server Started Trick (", payload.source or "N/A", "). Burst:", payload.burst_id, "For Req:", activeOriginalRequestId)
-            elseif currentMode ~= MODE_TRICK_IN_PROGRESS then 
-                print("MainController: ServerNotification TrickStarted, client wasn't in AWAITING_TRICK_START for this ID. Setting mode. Burst:", payload.burst_id, "ReqID:", payload.original_request_id)
+                print("MainController: Server Started Trick (", payload.source or "N/A", "). Burst:", payload.burst_id, "For Req:", activeOriginalRequestId, ". Mode set to TRICK_IN_PROGRESS.")
+            elseif currentMode ~= MODE_TRICK_IN_PROGRESS and payload.original_request_id == activeOriginalRequestId then
+                -- This could happen if client was in PlayerControl, server started trick (e.g. from previous session or edge case)
+                print("MainController: ServerNotification TrickStarted for current activeOriginalRequestId, client wasn't in AWAITING_TRICK_START. Setting mode to TRICK_IN_PROGRESS. Burst:", payload.burst_id, "ReqID:", payload.original_request_id)
                 currentMode = MODE_TRICK_IN_PROGRESS
-                activeOriginalRequestId = payload.original_request_id 
-            else
-                 print("MainController: ServerNotification TrickStarted for mismatched/old request ID while already in a trick. Current active:", activeOriginalRequestId)
+            elseif payload.original_request_id ~= activeOriginalRequestId then
+                 print("MainController: ServerNotification TrickStarted for mismatched/old request ID (", payload.original_request_id,"). Current active client ID:", activeOriginalRequestId, ". Ignoring.")
             end
         elseif payload.type == "TrickEnded" then
-            if currentMode == MODE_TRICK_IN_PROGRESS then
-                if not activeOriginalRequestId or payload.original_request_id == activeOriginalRequestId or not payload.original_request_id then
-                    currentMode = MODE_PLAYER_CONTROL
-                    print("MainController: Server Ended Trick. Success:", tostring(payload.success), ". Mode set to PlayerControl. ActiveID cleared.")
-                    activeOriginalRequestId = nil 
-                 else
-                    print("MainController: ServerNotification TrickEnded for a different request ID (", payload.original_request_id, ") than client's current (", activeOriginalRequestId or "N/A" ,"). Client remains in TrickInProgress if this was not its active trick.")
-                 end
+            -- Only transition to PlayerControl if the TrickEnded matches the client's active trick, OR if there's no active trick ID (general cleanup)
+            if not activeOriginalRequestId or payload.original_request_id == activeOriginalRequestId then
+                currentMode = MODE_PLAYER_CONTROL
+                print("MainController: Server Ended Trick. Success:", tostring(payload.success), ". Mode set to PlayerControl. ActiveID (", activeOriginalRequestId or "N/A", ") cleared.")
+                activeOriginalRequestId = nil 
             else
-                print("MainController: ServerNotification TrickEnded, but client not in TrickInProgress. Mode:", currentMode)
+                print("MainController: ServerNotification TrickEnded for a different request ID (", payload.original_request_id, ") than client's current (", activeOriginalRequestId ,"). Client mode remains:", currentMode)
             end
         elseif payload.type == "ReorientComplete" then 
+            print("MainController: Received ServerNotification ReorientComplete. Current client mode:", currentMode, "BurstID on payload:", payload.burst_id or "N/A")
             if currentMode == MODE_REORIENTING then
                 currentMode = MODE_PLAYER_CONTROL
-                print("MainController: Server confirmed ReorientComplete. Mode back to PlayerControl.")
+                -- activeOriginalRequestId should have been cleared when reorient was initiated by client,
+                -- or if it was a stale trick ID, this confirms it should be nil.
+                activeOriginalRequestId = nil 
+                print("MainController: ReorientComplete processed. Mode set to PlayerControl. Active Request ID confirmed cleared.")
             else
-                print("MainController: ServerNotification ReorientComplete, but client not in Reorienting mode. Current mode:", currentMode)
+                print("MainController: ServerNotification ReorientComplete, but client not in Reorienting mode. Current mode:", currentMode, ". Client mode remains:", currentMode, ". ActiveReqID:", activeOriginalRequestId or "N/A")
+                -- If server says reorient is done, and we had an activeOriginalRequestId, it's probably safe to clear it
+                -- as reorient would have cancelled any server-side trick.
+                if activeOriginalRequestId then
+                    print("MainController: Clearing activeOriginalRequestId due to ReorientComplete, even though not in MODE_REORIENTING.")
+                    activeOriginalRequestId = nil
+                end
             end
         end
     end)
@@ -200,7 +220,7 @@ function MainController:Start(dependencies)
 		if currentMode == MODE_PLAYER_CONTROL then
 			if inputControllerRef then ClientToServerBridge:SendDroneInputs(inputControllerRef:GetInputs()) end
         elseif currentMode == MODE_REORIENTING then
-            if doLog then print("MainController: Heartbeat - Reorienting (Server Authoritative)") end
+            if doLog then print("MainController: Heartbeat - Client Mode: Reorienting (Server Authoritative), ActiveReqID:", activeOriginalRequestId or "N/A") end
 		end
         if doLog and MyDrone and MyDrone.PrimaryPart then
             print(string.format("HeartbeatClient[%s]: Mode:%s ActiveReqID:%s Pos(%.1f,%.1f,%.1f)", MyDrone.Name, currentMode, activeOriginalRequestId or "N/A", MyDrone.PrimaryPart.Position.X, MyDrone.PrimaryPart.Position.Y, MyDrone.PrimaryPart.Position.Z))
