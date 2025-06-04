@@ -50,4 +50,9 @@ Remotes.ConfigureDroneAck.OnClientEvent:Connect(function(payload) Bridge.OnConfi
 
 print("ClientToServerBridge initialized.")
 
+-- Modified to use the new RemoteEvent for server-side physics
+function Bridge:SendDroneInputs(inputs)
+	Remotes.ClientDroneInputs:FireServer(inputs)
+end
+
 return Bridge

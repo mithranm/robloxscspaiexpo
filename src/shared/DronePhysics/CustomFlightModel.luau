@@ -1,107 +1,147 @@
--- src/shared/DronePhysics/CustomFlightModel.luau
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local Config = require(ReplicatedStorage.Shared.Config)
 
 local CustomFlightModel = {}
 CustomFlightModel.__index = CustomFlightModel
 
-CustomFlightModel.IsInitialized = false
-CustomFlightModel.IsPlayerControlled = true -- True if player inputs drive it, false if Gazebo guidance is active
-CustomFlightModel.IsInAssistanceMode = false -- Specifically for Gazebo assistance
+local lastLogTime = {}
+local logInterval = 0.5
 
-local droneInstance = nil
-local droneBody = nil -- Primary part of the drone for physics
-local actualMassKg = Config.DRONE_MASS_KG_DEFAULT
+function CustomFlightModel.new(droneModelInstance)
+	local self = setmetatable({}, CustomFlightModel)
 
--- Physics objects (reused)
-local vectorForce = nil
-local torque = nil
-local bodyAttachment = nil -- Attachment for forces/torques
+	self.IsInitialized = false
+	self.IsPlayerControlled = true
+	self.IsInAssistanceMode = false
 
--- For PD Attitude Control
-local prevPitchError = 0
-local prevRollError = 0
-local prevYawError = 0
+	self.droneInstance = nil
+	self.originalName = (droneModelInstance and droneModelInstance.Name) or ("CFM_Unknown_"..math.random(1000))
+	self.droneBody = nil
+	self.actualMassKg = Config.DRONE_MASS_KG_DEFAULT
+
+	self.vectorForce = nil
+	self.torque = nil
+	self.bodyAttachment = nil
+
+	self.prevPitchError = 0
+	self.prevRollError = 0
+	self.prevYawError = 0
+
+	self.lastAppliedForces = {force = Vector3.zero, torque = Vector3.zero}
+	lastLogTime[self] = 0
+
+	if not self:Initialize(droneModelInstance) then
+		warn(self.originalName, "CustomFlightModel.new: Initialization failed.")
+		return nil
+	end
+
+	return self
+end
 
 function CustomFlightModel:Initialize(droneModelInstance)
 	if not droneModelInstance or not droneModelInstance:IsA("Model") then
-		warn("CustomFlightModel:Initialize - Invalid drone model instance provided.")
+		warn(self.originalName, "CustomFlightModel:Initialize - Invalid drone model instance provided.")
 		return false
 	end
-	droneInstance = droneModelInstance
-	droneBody = droneInstance:FindFirstChild("Body") or droneInstance.PrimaryPart
+	self.droneInstance = droneModelInstance
+	self.droneBody = self.droneInstance:FindFirstChild("Body") or self.droneInstance.PrimaryPart
 
-	if not droneBody or not droneBody:IsA("BasePart") then
-		warn("CustomFlightModel:Initialize - Drone model missing 'Body' BasePart or PrimaryPart.")
+	if not self.droneBody or not self.droneBody:IsA("BasePart") then
+		warn(self.originalName, "CustomFlightModel:Initialize - Drone model missing 'Body' BasePart or PrimaryPart.")
 		return false
 	end
 
-	local massTag = droneBody:FindFirstChild("ActualMassKg")
-	if massTag and massTag:IsA("NumberValue") then
-		actualMassKg = massTag.Value
+	print(self.originalName, "CustomFlightModel:Initialize - Drone Body:", self.droneBody.Name, "Initial CFrame:", self.droneBody.CFrame, "Anchored:", self.droneBody.Anchored)
+
+	self.droneBody.Massless = false
+	print(self.originalName, "CustomFlightModel:Initialize - Set", self.droneBody.Name, ".Massless = false")
+
+	local massTag = self.droneBody:FindFirstChild("ActualMassKg")
+	local targetMass = Config.DRONE_MASS_KG_DEFAULT
+	if massTag and massTag:IsA("NumberValue") and massTag.Value > 0.001 then
+		targetMass = massTag.Value
+		print(self.originalName, "CustomFlightModel:Initialize - Using ActualMassKg tag value:", targetMass)
 	else
-		actualMassKg = Config.DRONE_MASS_KG_DEFAULT
-		warn("CustomFlightModel: Using default mass", actualMassKg, "kg for drone", droneInstance.Name)
+		warn(self.originalName, "CustomFlightModel:Initialize - No valid ActualMassKg tag. CFM internal actualMassKg will be:", self.actualMassKg, ". Will use part's default mass or density for PhysProps.")
+		targetMass = self.actualMassKg
 	end
-	
-	droneBody.Massless = true -- Ensure it's massless for custom gravity/forces
+	self.actualMassKg = targetMass
 
-	-- Setup Attachment if not exists
-	bodyAttachment = droneBody:FindFirstChild("BodyAttachment")
-	if not bodyAttachment then
-		bodyAttachment = Instance.new("Attachment")
-		bodyAttachment.Name = "BodyAttachment"
-		bodyAttachment.Position = Vector3.new(0,0,0) -- At the center of the body part
-		bodyAttachment.Parent = droneBody
+	local densityToSet
+	local volume = self.droneBody.Size.X * self.droneBody.Size.Y * self.droneBody.Size.Z
+	if volume > 0.000001 then
+		densityToSet = self.actualMassKg / volume
+	else
+		warn(self.originalName, "CustomFlightModel:Initialize - Drone body has zero or very small volume. Using default density (0.7) for PhysicalProperties.")
+		densityToSet = 0.7
+	end
+	local physProps = PhysicalProperties.new(densityToSet, 0.5, 0.5, 1, 1)
+	self.droneBody.CustomPhysicalProperties = physProps
+	print(self.originalName, "CustomFlightModel:Initialize - Set CustomPhysicalProperties. Target Mass:", self.actualMassKg, "Calculated Density:", densityToSet, "Actual Part Mass from GetMass():", self.droneBody:GetMass())
+
+
+	self.bodyAttachment = self.droneBody:FindFirstChild("BodyAttachment")
+	if not self.bodyAttachment then
+		self.bodyAttachment = Instance.new("Attachment")
+		self.bodyAttachment.Name = "BodyAttachment"
+		self.bodyAttachment.Position = Vector3.new(0,0,0)
+		self.bodyAttachment.Parent = self.droneBody
+		print(self.originalName, "CustomFlightModel:Initialize - Created BodyAttachment.")
+	else
+		print(self.originalName, "CustomFlightModel:Initialize - Found existing BodyAttachment.")
 	end
 
-	-- Setup VectorForce
-	vectorForce = droneBody:FindFirstChild("CustomVectorForce")
-	if vectorForce then vectorForce:Destroy() end -- Clear old one
-	vectorForce = Instance.new("VectorForce")
-	vectorForce.Name = "CustomVectorForce"
-	vectorForce.Attachment0 = bodyAttachment
-	vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
-	vectorForce.Force = Vector3.new(0, 0, 0)
-	vectorForce.Enabled = true
-	vectorForce.Parent = droneBody
+	if self.droneBody:FindFirstChild("CustomVectorForce") then self.droneBody.CustomVectorForce:Destroy() end
+	self.vectorForce = Instance.new("VectorForce")
+	self.vectorForce.Name = "CustomVectorForce"
+	self.vectorForce.Attachment0 = self.bodyAttachment
+	self.vectorForce.RelativeTo = Enum.ActuatorRelativeTo.World
+	self.vectorForce.Force = Vector3.new(0, 0, 0)
+	self.vectorForce.Enabled = true
+	self.vectorForce.Parent = self.droneBody
+	print(self.originalName, "CustomFlightModel:Initialize - Created CustomVectorForce.")
 
-	-- Setup Torque
-	torque = droneBody:FindFirstChild("CustomTorque")
-	if torque then torque:Destroy() end -- Clear old one
-	torque = Instance.new("Torque")
-	torque.Name = "CustomTorque"
-	torque.Attachment0 = bodyAttachment
-	torque.RelativeTo = Enum.ActuatorRelativeTo.World -- Torques are often easier in world space from local calculations
-	torque.Torque = Vector3.new(0, 0, 0)
-	torque.Enabled = true
-	torque.Parent = droneBody
-	
+	if self.droneBody:FindFirstChild("CustomTorque") then self.droneBody.CustomTorque:Destroy() end
+	self.torque = Instance.new("Torque")
+	self.torque.Name = "CustomTorque"
+	self.torque.Attachment0 = self.bodyAttachment
+	self.torque.RelativeTo = Enum.ActuatorRelativeTo.World
+	self.torque.Torque = Vector3.new(0, 0, 0)
+	self.torque.Enabled = true
+	self.torque.Parent = self.droneBody
+	print(self.originalName, "CustomFlightModel:Initialize - Created CustomTorque.")
+
+	self.droneBody.AssemblyLinearVelocity = Vector3.zero
+	self.droneBody.AssemblyAngularVelocity = Vector3.zero
+	print(self.originalName, "CustomFlightModel:Initialize - Zeroed initial velocities for", self.droneBody.Name)
+
 	self.IsInitialized = true
 	self.IsPlayerControlled = true
 	self.IsInAssistanceMode = false
-	print("CustomFlightModel: Initialized for drone -", droneInstance.Name, "Mass:", actualMassKg, "kg")
+	print(self.originalName, "CustomFlightModel: Initialized successfully. Effective Mass (GetMass):", self.droneBody:GetMass(), "kg. CFM actualMassKg:", self.actualMassKg, "kg. Body CFrame:", self.droneBody.CFrame)
 	return true
 end
 
 function CustomFlightModel:GetCurrentState()
-	if not self.IsInitialized or not droneBody or not droneBody.Parent then
+	if not self.IsInitialized or not self.droneBody or not self.droneBody.Parent then
 		return {
 			cframe = CFrame.new(), position = Vector3.new(),
 			linear_velocity = Vector3.new(), angular_velocity = Vector3.new(),
-			mass_kg = actualMassKg,
-			isStable = false -- Default to not stable if not initialized
+			mass_kg = self.actualMassKg,
+			isStable = false,
+			breachReason = "NOT_INITIALIZED"
 		}
 	end
-	
-	local currentCFrame = droneBody.CFrame
-	local currentPosition = droneBody.Position
-	local currentLinVel = droneBody.AssemblyLinearVelocity
-	local currentAngVel = droneBody.AssemblyAngularVelocity
 
-	-- Check safe envelope
+	local currentCFrame = self.droneBody.CFrame
+	local currentPosition = currentCFrame.Position
+	local currentLinVel = self.droneBody.AssemblyLinearVelocity
+	local currentAngVel = self.droneBody.AssemblyAngularVelocity
+	local currentMass = self.droneBody:GetMass()
+
 	local upVector = currentCFrame.UpVector
 	local worldUp = Vector3.new(0, 1, 0)
 	local tiltAngleRad = math.acos(math.clamp(upVector:Dot(worldUp), -1, 1))
@@ -112,153 +152,151 @@ function CustomFlightModel:GetCurrentState()
 	local isStable = true
 	local breachReason = "NONE"
 
-	if tiltAngleDeg > Config.MAX_SAFE_ATTITUDE_DEGREES then
-		isStable = false
-		breachReason = "EXCESSIVE_TILT"
-	elseif math.abs(math.deg(localAngVel.X)) > Config.MAX_SAFE_ROLL_RATE_DPS then -- Roll is around local X
-		isStable = false
-		breachReason = "EXCESSIVE_ROLL_RATE"
-	elseif math.abs(math.deg(localAngVel.Y)) > Config.MAX_SAFE_PITCH_RATE_DPS then -- Pitch is around local Y
-		isStable = false
-		breachReason = "EXCESSIVE_PITCH_RATE"
-	elseif math.abs(math.deg(localAngVel.Z)) > Config.MAX_SAFE_YAW_RATE_DPS then -- Yaw is around local Z
-		isStable = false
-		breachReason = "EXCESSIVE_YAW_RATE"
-	end
+	if tiltAngleDeg > Config.MAX_SAFE_ATTITUDE_DEGREES then isStable = false; breachReason = "EXCESSIVE_TILT"
+	elseif math.abs(math.deg(localAngVel.X)) > Config.MAX_SAFE_ROLL_RATE_DPS then isStable = false; breachReason = "EXCESSIVE_ROLL_RATE"
+	elseif math.abs(math.deg(localAngVel.Y)) > Config.MAX_SAFE_PITCH_RATE_DPS then isStable = false; breachReason = "EXCESSIVE_PITCH_RATE"
+	elseif math.abs(math.deg(localAngVel.Z)) > Config.MAX_SAFE_YAW_RATE_DPS then isStable = false; breachReason = "EXCESSIVE_YAW_RATE" end
 
 	return {
-		cframe = currentCFrame,
-		position = currentPosition,
-		linear_velocity = currentLinVel,
-		angular_velocity = currentAngVel,
-		mass_kg = actualMassKg,
-		isStable = isStable,
-		breachReason = breachReason,
-		currentTiltDegrees = tiltAngleDeg,
-		localAngularVelocity = localAngVel -- rad/s
+		cframe = currentCFrame, position = currentPosition,
+		linear_velocity = currentLinVel, angular_velocity = currentAngVel,
+		mass_kg = currentMass, isStable = isStable, breachReason = breachReason,
+		currentTiltDegrees = tiltAngleDeg, localAngularVelocity = localAngVel
 	}
 end
 
 function CustomFlightModel:SetPlayerControl(isPlayerInControl)
 	self.IsPlayerControlled = isPlayerInControl
 	if isPlayerInControl then
-		self.IsInAssistanceMode = false -- Player control implies not in assistance
-		print(droneInstance and droneInstance.Name, "CustomFlightModel: Player control ENABLED")
+		self.IsInAssistanceMode = false
+		print(self.originalName, "CustomFlightModel: Player control ENABLED (Server-side perspective)")
 	else
-		print(droneInstance and droneInstance.Name, "CustomFlightModel: Player control DISABLED (Gazebo guidance active)")
+		print(self.originalName, "CustomFlightModel: Player control DISABLED (Server-side perspective, e.g., for trick mode)")
 	end
 end
 
 function CustomFlightModel:SetAssistanceMode(isAssisting)
-    self.IsInAssistanceMode = isAssisting
-    self:SetPlayerControl(not isAssisting) -- Assistance mode means player is not in control
+	self.IsInAssistanceMode = isAssisting
+	self:SetPlayerControl(not isAssisting)
 end
 
--- Called by guidance controllers (Trick or Assistance)
 function CustomFlightModel:ApplyGuidanceForces(targetWorldForce, targetWorldTorque)
-	if not self.IsInitialized or self.IsPlayerControlled then return end -- Only apply if guidance is active
+	if not self.IsInitialized or self.IsPlayerControlled then return end
+	if not self.droneBody or not self.droneBody.Parent then self.IsInitialized = false; return end
+	if not self.vectorForce or not self.torque then
+		warn(self.originalName, "CustomFlightModel:ApplyGuidanceForces - Physics objects not ready")
+		return
+	end
 
-	-- Gravity is always applied
-	local gravityForce = Vector3.new(0, Config.CUSTOM_GRAVITY_Y * actualMassKg, 0)
-	
-	-- Drag (still applies during guidance)
-	local velocity = droneBody.AssemblyLinearVelocity
-	local angularVelocity = droneBody.AssemblyAngularVelocity
-	local linearDragForce = -velocity * Config.DRAG_COEFFICIENT_LINEAR 
+	local currentMass = self.droneBody:GetMass()
+	local gravityForce = Vector3.new(0, Config.CUSTOM_GRAVITY_Y * currentMass, 0)
+
+	local velocity = self.droneBody.AssemblyLinearVelocity
+	local angularVelocity = self.droneBody.AssemblyAngularVelocity
+	local linearDragForce = -velocity * Config.DRAG_COEFFICIENT_LINEAR
 	local speed = velocity.Magnitude
 	local quadraticDragForce = Vector3.new()
 	if speed > 0.01 then quadraticDragForce = -velocity.Unit * speed * speed * Config.DRAG_COEFFICIENT_QUADRATIC end
 	local angularDragTorque = -angularVelocity * Config.DRAG_COEFFICIENT_ANGULAR
-	
-	vectorForce.Force = gravityForce + linearDragForce + quadraticDragForce + targetWorldForce
-	torque.Torque = angularDragTorque + targetWorldTorque
+
+	self.vectorForce.Force = gravityForce + linearDragForce + quadraticDragForce + targetWorldForce
+	self.torque.Torque = angularDragTorque + targetWorldTorque
+	self.lastAppliedForces = {force = self.vectorForce.Force, torque = self.torque.Torque}
 end
 
--- Main update loop when player is controlling
 function CustomFlightModel:Update(deltaTime, inputThrottle, inputRoll, inputPitch, inputYaw)
-	if not self.IsInitialized or not self.IsPlayerControlled or self.IsInAssistanceMode then
-		if not self.IsPlayerControlled then -- If guidance mode, clear any residual player-input forces
-			-- Forces/torques are handled by ApplyGuidanceForces
-		end
-		return
+	local env = RunService:IsServer() and "SERVER" or "CLIENT"
+	local doLog = false
+	local currentDroneMass = -1
+	if self.droneBody and self.droneBody.Parent then currentDroneMass = self.droneBody:GetMass() else return end
+
+	if time() - (lastLogTime[self] or 0) > logInterval or inputThrottle ~= 0 or inputRoll ~= 0 or inputPitch ~= 0 or inputYaw ~= 0 then
+		doLog = true
+		lastLogTime[self] = time()
 	end
-	if not droneBody or not droneBody.Parent then 
-		self.IsInitialized = false -- Drone got destroyed
+
+	if doLog then
+		print(string.format("CFM:Update[%s|%s] Init:%s PCtrl:%s Assist:%s In: T:%.2f R:%.2f P:%.2f Y:%.2f Mass:%.3f",
+			self.originalName, env, tostring(self.IsInitialized), tostring(self.IsPlayerControlled), tostring(self.IsInAssistanceMode),
+			inputThrottle, inputRoll, inputPitch, inputYaw, currentDroneMass))
+	end
+
+	if not self.IsInitialized then return end
+    -- Server-side physics: self.IsPlayerControlled is now managed by RoSocketServiceHandler's playerControlState
+    -- For this CFM:Update, we assume if it's called, inputs should be processed or guidance forces applied.
+    -- The IsPlayerControlled flag on the CFM instance itself is less critical here since the caller (RoSocketServiceHandler) manages state.
+
+	if not self.vectorForce or not self.torque then
+		warn(self.originalName, "CFM:Update - Physics objects not ready")
 		return
 	end
 
-	local currentCFrame = droneBody.CFrame
-	local currentAngVelWorld = droneBody.AssemblyAngularVelocity
+	local currentCFrame = self.droneBody.CFrame
+	local currentPosition = currentCFrame.Position
+	local currentAngVelWorld = self.droneBody.AssemblyAngularVelocity
+	local currentLinVelWorld = self.droneBody.AssemblyLinearVelocity
 	local currentAngVelLocal = currentCFrame:VectorToObjectSpace(currentAngVelWorld)
+	currentDroneMass = self.droneBody:GetMass() -- Re-fetch in case it changed due to external factors (unlikely here)
 
-	-- 1. Calculate Target Angular Velocities from Inputs
-	-- Inputs are typically -1 to 1. Throttle 0 to 1.
+	if doLog or inputRoll ~=0 or inputPitch ~= 0 or inputYaw ~=0 then
+		print(string.format("CFM:Update AngVels - World(%.2f,%.2f,%.2f) Local(%.2f,%.2f,%.2f)",
+			currentAngVelWorld.X, currentAngVelWorld.Y, currentAngVelWorld.Z,
+			currentAngVelLocal.X, currentAngVelLocal.Y, currentAngVelLocal.Z))
+	end
+
 	local targetRollRate = inputRoll * Config.TARGET_ROLL_RATE_MAX
-	local targetPitchRate = inputPitch * Config.TARGET_PITCH_RATE_MAX 
+	local targetPitchRate = inputPitch * Config.TARGET_PITCH_RATE_MAX
 	local targetYawRate = inputYaw * Config.TARGET_YAW_RATE_MAX
-	
-	-- Convert target rates to drone's local axes
-	-- For FPV drones, roll input controls roll rate around drone's X-axis
-	-- Pitch input controls pitch rate around drone's Y-axis
-	-- Yaw input controls yaw rate around drone's Z-axis
 	local targetAngVelLocal = Vector3.new(targetRollRate, targetPitchRate, targetYawRate)
 
-	-- 2. Attitude Control (PD Controller for angular velocity)
 	local errorAngVelLocal = targetAngVelLocal - currentAngVelLocal
-	
-	-- P Term
 	local pTorqueLocal = errorAngVelLocal * Config.ATTITUDE_P_GAIN
-	
-	-- D Term (simplified - should use (error - prevError)/dt for true D)
-	-- For simplicity here, we are damping based on current local angular velocity error rate
-	-- A more robust D term would be:
-	-- local pitchRateError = errorAngVelLocal.Y - prevPitchError; prevPitchError = errorAngVelLocal.Y
-	-- local rollRateError  = errorAngVelLocal.X - prevRollError;  prevRollError  = errorAngVelLocal.X
-	-- local yawRateError   = errorAngVelLocal.Z - prevYawError;   prevYawError   = errorAngVelLocal.Z
-	-- local dTorqueLocal = Vector3.new(rollRateError, pitchRateError, yawRateError) * (Config.ATTITUDE_D_GAIN / deltaTime)
-	-- For now, simpler D term acting like damping on the error itself:
-	local dTorqueLocal = errorAngVelLocal * Config.ATTITUDE_D_GAIN -- This is more like damping on error, not true derivative of error
-                                                                -- For a more correct PD on rate:
-                                                                -- D = (currentError - prevError) / dt
-                                                                -- Torque_D = K_d * ( (targetAngVelLocal - currentAngVelLocal) - (targetAngVelLocal - prevAngVelLocal) ) / dt
-                                                                -- Torque_D = K_d * ( prevAngVelLocal - currentAngVelLocal ) / dt
-                                                                -- This is essentially damping based on change in angular velocity.
-                                                                -- Or simply: Torque_D = -K_d_effective * currentAngVelLocal (damping existing rates)
-    -- Let's use a direct damping D-term on current local angular velocity to stabilize
-    dTorqueLocal = -currentAngVelLocal * Config.ATTITUDE_D_GAIN
-
+	local dTorqueLocal = -currentAngVelLocal * Config.ATTITUDE_D_GAIN
 	local netTorqueLocal = pTorqueLocal + dTorqueLocal
 	local netTorqueWorld = currentCFrame:VectorToWorldSpace(netTorqueLocal)
-	
-	-- 3. Thrust Calculation
-	-- inputThrottle is 0 to 1 (or -1 to 1 if you allow reverse). Assume 0-1 for upward.
-	local currentThrustMagnitude = math.max(0, inputThrottle) * Config.MAX_THRUST_FORCE 
+
+	local currentThrustMagnitude = math.max(0, inputThrottle) * Config.MAX_THRUST_FORCE
 	local thrustForceWorld = currentCFrame.UpVector * currentThrustMagnitude
 
-	-- 4. Gravity
-	local gravityForce = Vector3.new(0, Config.CUSTOM_GRAVITY_Y * actualMassKg, 0)
+	local gravityForce = Vector3.new(0, Config.CUSTOM_GRAVITY_Y * currentDroneMass, 0)
 
-	-- 5. Drag
-	local velocity = droneBody.AssemblyLinearVelocity
-	local linearDragForce = -velocity * Config.DRAG_COEFFICIENT_LINEAR 
-	local speed = velocity.Magnitude
+	local linearDragForce = -currentLinVelWorld * Config.DRAG_COEFFICIENT_LINEAR
+	local speed = currentLinVelWorld.Magnitude
 	local quadraticDragForce = Vector3.new()
-	if speed > 0.01 then quadraticDragForce = -velocity.Unit * speed * speed * Config.DRAG_COEFFICIENT_QUADRATIC end
-	local angularDragTorqueWorld = -currentAngVelWorld * Config.DRAG_COEFFICIENT_ANGULAR -- Damping angular motion in world frame
+	if speed > 0.01 then quadraticDragForce = -currentLinVelWorld.Unit * speed * speed * Config.DRAG_COEFFICIENT_QUADRATIC end
+	local angularDragTorqueWorld = -currentAngVelWorld * Config.DRAG_COEFFICIENT_ANGULAR
 
-	-- 6. Apply Forces and Torques
-	vectorForce.Force = thrustForceWorld + gravityForce + linearDragForce + quadraticDragForce
-	torque.Torque = netTorqueWorld + angularDragTorqueWorld -- Add angular drag to controller torque
+	local combinedForcesWithOurGravity = thrustForceWorld + gravityForce + linearDragForce + quadraticDragForce
+
+    -- SIMPLIFIED GROUND INTERACTION for server-side physics:
+    -- Rely on Roblox's default collision response. Remove custom raycasting and force adjustment.
+    -- The Body part should have CanCollide = true.
+    local finalAppliedForce = combinedForcesWithOurGravity
+
+	self.vectorForce.Force = finalAppliedForce
+	self.torque.Torque = netTorqueWorld + angularDragTorqueWorld
+	self.lastAppliedForces = {force = self.vectorForce.Force, torque = self.torque.Torque}
+
+	if doLog then
+		print(string.format("CFM:Update[%s|%s] Applied F:(%.1f,%.1f,%.1f) T:(%.1f,%.1f,%.1f) | DronePos:(%.1f,%.1f,%.1f) LinVelY: %.2f",
+			self.originalName, env,
+			self.vectorForce.Force.X, self.vectorForce.Force.Y, self.vectorForce.Force.Z,
+			self.torque.Torque.X, self.torque.Torque.Y, self.torque.Torque.Z,
+			currentPosition.X, currentPosition.Y, currentPosition.Z,
+			currentLinVelWorld.Y
+		))
+	end
 end
 
 function CustomFlightModel:Cleanup()
-	if vectorForce then vectorForce:Destroy(); vectorForce = nil end
-	if torque then torque:Destroy(); torque = nil end
-	-- bodyAttachment is parented to droneBody, will be destroyed with it or if droneBody is cleared
+	if self.vectorForce then self.vectorForce:Destroy(); self.vectorForce = nil end
+	if self.torque then self.torque:Destroy(); self.torque = nil end
+
+	print(self.originalName, "CustomFlightModel: Cleaned up instance.")
+	if lastLogTime[self] then lastLogTime[self] = nil end
 	self.IsInitialized = false
-	droneInstance = nil
-	droneBody = nil
-	print("CustomFlightModel: Cleaned up.")
+	self.droneInstance = nil
+	self.droneBody = nil
 end
 
 return CustomFlightModel

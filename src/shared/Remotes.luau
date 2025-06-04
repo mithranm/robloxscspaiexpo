@@ -22,7 +22,7 @@ local function getOrCreateRemote(name, className)
 end
 
 Remotes.RequestTrick = getOrCreateRemote("RequestTrick", "RemoteFunction")
-Remotes.ConfigureDrone = getOrCreateRemote("ConfigureDrone", "RemoteFunction") 
+Remotes.ConfigureDrone = getOrCreateRemote("ConfigureDrone", "RemoteFunction")
 Remotes.RequestAssistance = getOrCreateRemote("RequestAssistance", "RemoteFunction") -- NEW FOR LATER
 
 Remotes.TrickDataStarted = getOrCreateRemote("TrickDataStarted", "RemoteEvent")
@@ -37,5 +37,10 @@ Remotes.AssistanceDataEnded = getOrCreateRemote("AssistanceDataEnded", "RemoteEv
 Remotes.AssistanceError = getOrCreateRemote("AssistanceError", "RemoteEvent") -- NEW FOR LATER
 
 Remotes.ServerNotification = getOrCreateRemote("ServerNotification", "RemoteEvent")
+
+-- OLD: Remotes.SendDroneInputsEvent = getOrCreateRemote("SendDroneInputsEvent", "RemoteEvent") -- For client to send drone flight inputs
+-- NEW: Remote for client to send drone flight inputs to server for server-side physics
+Remotes.ClientDroneInputs = getOrCreateRemote("ClientDroneInputs", "RemoteEvent")
+
 
 return Remotes

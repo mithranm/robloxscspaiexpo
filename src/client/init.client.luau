@@ -14,6 +14,11 @@ if not player then
 	return
 end
 
+-- DO NOT set DevComputerMovementMode from client; server will handle this.
+-- player.DevComputerMovementMode = Enum.DevComputerMovementMode.Scriptable -- REMOVED
+-- player.DevTouchMovementMode = Enum.DevTouchMovementMode.Scriptable -- REMOVED
+-- print("CLIENT [init.client.luau]: Set LocalPlayer.DevComputerMovementMode and DevTouchMovementMode to Scriptable.") -- REMOVED
+
 local playerGui = player:WaitForChild("PlayerGui")
 if not playerGui then
 	warn("CLIENT [init.client.luau]: PlayerGui not found. UI-dependent features may fail.")
