@@ -1,37 +1,35 @@
 -- src/client/ClientToServerBridge.luau
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Remotes = require(ReplicatedStorage.Shared.Remotes)
-local HttpService = game:GetService("HttpService") -- Still needed for GenerateGUID
+local HttpService = game:GetService("HttpService")
 
 local Bridge = {}
 
-Bridge.OnTrickDataStarted = Instance.new("BindableEvent")
-Bridge.OnTrickDataChunk = Instance.new("BindableEvent")
-Bridge.OnTrickDataEnded = Instance.new("BindableEvent")
-Bridge.OnTrickError = Instance.new("BindableEvent")
 Bridge.OnConfigureDroneAck = Instance.new("BindableEvent")
 
 function Bridge:RequestTrick(payload)
-	-- payload.original_request_id is now expected to be set by the caller (MainController)
 	if not payload.original_request_id then 
         payload.original_request_id = HttpService:GenerateGUID(false)
         warn("ClientToServerBridge:RequestTrick - original_request_id was not in payload, generated one:", payload.original_request_id)
     end
 	print("ClientToServerBridge: Sending RequestTrick:", payload.original_request_id, "TrickType:", payload.trick_type)
+	
 	local success, result = pcall(Remotes.RequestTrick.InvokeServer, Remotes.RequestTrick, payload)
-	if success then
-		print("ClientToServerBridge: RequestTrick InvokeServer result:", result)
-		if result and result.success then
-			return payload.original_request_id -- Return the ID on success, as it was successfully forwarded
-		else
-			local errorMsg = (result and result.error) or "Failed to forward request to orchestrator."
-			Bridge.OnTrickError:Fire({ original_request_id = payload.original_request_id, message = errorMsg})
-			return nil
-		end
+	
+    if success then
+		print("ClientToServerBridge: RequestTrick InvokeServer successful. Server raw response:", result)
+        -- The client's MainController now relies on ServerNotifications for trick state changes.
+        -- The 'result' here is from the OnServerInvoke handler, which should indicate if the server *accepted* the request for processing.
+        if typeof(result) == "table" and result.success ~= nil then
+            return result -- Pass the server's immediate response back (e.g., {success=true, message="..."} or {success=false, error="..."})
+        else
+            -- If server returns non-table or no .success field, assume the invoke itself was okay but server response was malformed for immediate status.
+            warn("ClientToServerBridge: RequestTrick InvokeServer returned unexpected result format:", result)
+            return { success = true, message = "Request sent, server response format unexpected."} -- Assume sent, let notifications handle state.
+        end
 	else
-		warn("ClientToServerBridge: Error invoking RequestTrick:", result)
-		Bridge.OnTrickError:Fire({ original_request_id = payload.original_request_id, message = "Roblox server invoke error: " .. tostring(result)})
-		return nil
+		warn("ClientToServerBridge: Error invoking RequestTrick (pcall failed):", result)
+		return { success = false, error = "InvokeServer pcall failed: " .. tostring(result) } -- Indicate pcall failure
 	end
 end
 
@@ -44,18 +42,19 @@ function Bridge:ConfigureDrone(droneParamsPayload)
 	else
 		warn("ClientToServerBridge: Error invoking ConfigureDrone:", result)
 	end
-	return droneParamsPayload.original_request_id
+	return droneParamsPayload.original_request_id -- Consider returning server's result table here too
 end
 
-Remotes.TrickDataStarted.OnClientEvent:Connect(function(payload) Bridge.OnTrickDataStarted:Fire(payload) end)
-Remotes.TrickDataChunk.OnClientEvent:Connect(function(payload) Bridge.OnTrickDataChunk:Fire(payload) end)
-Remotes.TrickDataEnded.OnClientEvent:Connect(function(payload) Bridge.OnTrickDataEnded:Fire(payload) end)
-Remotes.TrickError.OnClientEvent:Connect(function(payload) Bridge.OnTrickError:Fire(payload) end)
+-- These are for raw Gazebo data, client currently doesn't use them for physics.
+Remotes.TrickDataStarted.OnClientEvent:Connect(function(payload) print("[ClientBridge] Gazebo TrickDataStarted", payload.burst_id) end)
+Remotes.TrickDataChunk.OnClientEvent:Connect(function(payload) print("[ClientBridge] Gazebo TrickDataChunk", payload.burst_id) end)
+Remotes.TrickDataEnded.OnClientEvent:Connect(function(payload) print("[ClientBridge] Gazebo TrickDataEnded", payload.burst_id) end)
+Remotes.TrickError.OnClientEvent:Connect(function(payload) print("[ClientBridge] Gazebo TrickError", payload.message) end)
+
 Remotes.ConfigureDroneAck.OnClientEvent:Connect(function(payload) Bridge.OnConfigureDroneAck:Fire(payload) end)
 
 print("ClientToServerBridge initialized.")
 
--- Modified to use the new RemoteEvent for server-side physics
 function Bridge:SendDroneInputs(inputs)
 	Remotes.ClientDroneInputs:FireServer(inputs)
 end

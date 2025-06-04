@@ -11,19 +11,18 @@ Config.HTTP_TIMEOUT_SECONDS = 5
 -- Drone Physics (Player Controlled Flight)
 Config.DRONE_MASS_KG_DEFAULT = 0.05 
 Config.CUSTOM_GRAVITY_Y = -196.2 
-Config.MAX_THRUST_FORCE = 80 -- For larger drone body (1, 0.5, 1) with density 0.7 giving ~0.35kg mass
+Config.MAX_THRUST_FORCE = 80 
 
-Config.TARGET_PITCH_RATE_MAX = math.rad(180) 
-Config.TARGET_ROLL_RATE_MAX = math.rad(180)  
-Config.TARGET_YAW_RATE_MAX = math.rad(120)   
+Config.TARGET_PITCH_RATE_MAX = math.rad(180) -- degrees/sec
+Config.TARGET_ROLL_RATE_MAX = math.rad(180)  -- degrees/sec
+Config.TARGET_YAW_RATE_MAX = math.rad(120)   -- degrees/sec
 
--- ADJUSTED GAINS FOR MORE STABILITY:
-Config.ATTITUDE_P_GAIN = 0.03  -- Reduced P-Gain slightly for less aggressive initial response
-Config.ATTITUDE_D_GAIN = 0.015     -- Increased D-Gain significantly for more damping
+Config.ATTITUDE_P_GAIN = 0.03  
+Config.ATTITUDE_D_GAIN = 0.015     
 
 Config.DRAG_COEFFICIENT_LINEAR = 0.08    
 Config.DRAG_COEFFICIENT_QUADRATIC = 0.05 
-Config.DRAG_COEFFICIENT_ANGULAR = 0.15   -- Increased angular drag for more natural resistance to rotation
+Config.DRAG_COEFFICIENT_ANGULAR = 0.15   
 
 -- Safe Envelope 
 Config.MAX_SAFE_ATTITUDE_DEGREES = 75
@@ -31,12 +30,17 @@ Config.MAX_SAFE_ROLL_RATE_DPS = 360
 Config.MAX_SAFE_PITCH_RATE_DPS = 360 
 Config.MAX_SAFE_YAW_RATE_DPS = 270   
 
--- PD Controller Gains for Gazebo Guided Modes (these seem okay for now)
-Config.GUIDANCE_POS_KP = 75 
-Config.GUIDANCE_POS_KD = 15 
-Config.GUIDANCE_ROT_KP = 40 
-Config.GUIDANCE_ROT_KD = 5  
+-- PD Controller Gains for SERVER Guided Modes (Gazebo or Fallback)
+Config.GUIDANCE_POS_KP = 25  
+Config.GUIDANCE_POS_KD = 10  
+Config.GUIDANCE_ROT_KP = 15  
+Config.GUIDANCE_ROT_KD = 5   
 
-Config.TRICK_ACTIVATION_DELAY = 0.5
+Config.TRICK_ACTIVATION_DELAY = 0.5 
+
+-- Reorientation (F key)
+Config.REORIENT_DURATION = 0.75 
+Config.REORIENT_ROT_KP = 20 
+Config.REORIENT_ROT_KD = 3  
 
 return Config

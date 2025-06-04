@@ -5,158 +5,332 @@ local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local ServerScriptService = game:GetService("ServerScriptService")
 
 local RoSocket = require(ServerStorage.RoSocket)
 local Config = require(ReplicatedStorage.Shared.Config)
 local Remotes = require(ReplicatedStorage.Shared.Remotes)
 local CustomFlightModel = require(ReplicatedStorage.Shared.DronePhysics.CustomFlightModel)
+local ServerDroneGuidance = require(ServerScriptService.Server.ServerDroneGuidance)
 
 local RoSocketServiceHandler = {}
 
 local socketConnection = nil
-local MAX_RETRIES = 5
-local currentRetries = 0
+local MAX_RETRIES = 5; local currentRetries = 0
 local orchestratorWsUrl = Config.ROSOCKET_CONNECTION_URL
 
 local activePlayersByUserId = {}
-local pendingClientRequests = {}
+local pendingClientRequests = {} 
 local serverFlightModels = {}
+local serverGuidanceControllers = {}
 local playerLatestInputs = {}
-local playerControlState = {}
+local activeTrickTimeouts = {} 
+local activeReorientations = {}
+
+local FALLBACK_TIMEOUT_DURATION = Config.TRICK_ACTIVATION_DELAY + 0.5 
 
 local function connectToOrchestrator()
-	if socketConnection and socketConnection.readyState == "OPEN" then print("RoSocketServiceHandler: Already connected or connecting."); return end
-	if not HttpService.HttpEnabled then warn("RoSocketServiceHandler: HttpService is not enabled! RoSocket will not function."); return	end
-	print("RoSocketServiceHandler: Attempting to connect to Orchestrator at:", orchestratorWsUrl); currentRetries += 1
+	if socketConnection and socketConnection.readyState == "OPEN" then return end
+	if not HttpService.HttpEnabled then warn("RoSocketServiceHandler: HttpService disabled!"); return end
+	print("RoSocketServiceHandler: Connecting to Orchestrator:", orchestratorWsUrl); currentRetries += 1
 	local successConnect, newSocket = pcall(RoSocket.Connect, RoSocket, orchestratorWsUrl)
-	if not successConnect or not newSocket or typeof(newSocket) ~= "table" then
-		warn("RoSocketServiceHandler: RoSocket:Connect failed or returned invalid object. Error:", tostring(newSocket)); socketConnection = nil
+	if not successConnect or not newSocket or typeof(newSocket) ~= "table" or newSocket.error then 
+		warn("RoSocketServiceHandler: RoSocket:Connect failed:", tostring(newSocket and newSocket.error or newSocket)); socketConnection = nil
 		if currentRetries < MAX_RETRIES then task.wait(5); connectToOrchestrator() else warn("Max retries for RoSocket connect.") end; return
 	end
-	socketConnection = newSocket; print("RoSocketServiceHandler: RoSocket Connect called. Socket object received.")
+	socketConnection = newSocket; print("RoSocketServiceHandler: RoSocket Connect called.")
 	socketConnection.OnMessageReceived:Connect(RoSocketServiceHandler.OnOrchestratorMessage)
 	socketConnection.OnDisconnect:Connect(function()
-		print("RoSocketServiceHandler: Disconnected from Orchestrator via RoSocket."); socketConnection = nil
-		if currentRetries < MAX_RETRIES then warn("RoSocketServiceHandler: Will attempt to reconnect in 5 seconds..."); task.wait(5); connectToOrchestrator()
-		else warn("RoSocketServiceHandler: Max retries reached. Not attempting further reconnections automatically.") end
+		print("RoSocketServiceHandler: RoSocket disconnected."); socketConnection = nil
+		if currentRetries < MAX_RETRIES then task.wait(5); connectToOrchestrator() else warn("Max retries for RoSocket.") end
 	end)
-	socketConnection.OnErrorReceived:Connect(function(err) warn("RoSocketServiceHandler: Error from RoSocket connection:", err) end)
-	currentRetries = 0; print("RoSocketServiceHandler: Handlers set. RoSocket should be attempting to connect/poll.")
+	socketConnection.OnErrorReceived:Connect(function(err) warn("RoSocketServiceHandler: RoSocket Error:", err) end)
+	currentRetries = 0
 end
 
+local function initiateServerFallback(player, originalRequestId, reason)
+    local requestData = pendingClientRequests[originalRequestId]
+    if not requestData then
+        warn("RoSocketServiceHandler:initiateServerFallback - No pending request data for ID:", originalRequestId)
+        return
+    end
+    local clientPayload = requestData.clientPayload
+
+    local cfm = serverFlightModels[player.UserId]
+    local guidanceCtrl = serverGuidanceControllers[player.UserId]
+    local drone = Workspace:FindFirstChild("PlayerDrone_" .. player.Name)
+
+    if not (cfm and guidanceCtrl and drone and drone.PrimaryPart) then
+        warn("RoSocketServiceHandler:initiateServerFallback - Cannot initiate fallback, components missing for", player.Name, "ReqID:", originalRequestId)
+        if cfm then cfm:SetControlMode("Player") end
+        Remotes.ServerNotification:FireClient(player, {type="TrickEnded", original_request_id=originalRequestId, success=false, message="Server error during fallback init."})
+        if pendingClientRequests[originalRequestId] then pendingClientRequests[originalRequestId] = nil end
+        return
+    end
+    
+    warn("RoSocketServiceHandler:", reason, "for OrigID:", originalRequestId, "Player:", player.Name, ". Initiating server fallback.")
+    if activeTrickTimeouts[originalRequestId] then task.cancel(activeTrickTimeouts[originalRequestId]); activeTrickTimeouts[originalRequestId] = nil end
+
+    local currentDroneState = cfm:GetCurrentState() 
+    local fallbackFrames = ServerDroneGuidance.generatePreProgrammedBarrelRoll(currentDroneState.cframe, clientPayload.direction or "RIGHT", 2.0, 40)
+    local fallbackBurstId = "server_fallback_" .. HttpService:GenerateGUID(false)
+
+    cfm:SetControlMode("Guidance") 
+    guidanceCtrl:StartGuidance(fallbackBurstId, fallbackFrames, currentDroneState.cframe) -- Pass CFrame for initial yaw
+    Remotes.ServerNotification:FireClient(player, {type="TrickStarted", original_request_id=originalRequestId, burst_id=fallbackBurstId, source="ServerFallback"})
+    if pendingClientRequests[originalRequestId] then pendingClientRequests[originalRequestId].system_request_id = fallbackBurstId end
+end
+
+
 function RoSocketServiceHandler.OnOrchestratorMessage(message)
-	local success, decoded = pcall(HttpService.JSONDecode, HttpService, message)
-	if not success then warn("RoSocketServiceHandler: Failed to decode JSON message from orchestrator:", message, decoded); return end
-	print("RoSocketServiceHandler: Message from Orchestrator:", decoded.type, decoded.payload and decoded.payload.original_request_id or "N/A")
-	local clientRequestInfo; local systemRequestId = decoded.payload and (decoded.payload.system_request_id or decoded.payload.burst_id)
-	if systemRequestId then clientRequestInfo = pendingClientRequests[systemRequestId] end
-	if not clientRequestInfo and decoded.payload and decoded.payload.roblox_client_id then
-		local robloxPlayerUserId = tonumber(decoded.payload.roblox_client_id)
-		if robloxPlayerUserId and activePlayersByUserId[robloxPlayerUserId] then
-			clientRequestInfo = { player = activePlayersByUserId[robloxPlayerUserId], original_client_request_id = decoded.payload.original_request_id }
-			if not decoded.payload.original_request_id then warn("RoSocketServiceHandler: Fallback to roblox_client_id found player, but message missing original_request_id."); clientRequestInfo = nil end
-		end
-	end
-	if not clientRequestInfo then warn("RoSocketServiceHandler: Could not map orchestrator message back to a player/request. SysID:", systemRequestId or "N/A", "OrigID:", (decoded.payload and decoded.payload.original_request_id) or "N/A", "RobloxCID:", (decoded.payload and decoded.payload.roblox_client_id) or "N/A"); return end
-	local playerToFire = clientRequestInfo.player
-	if not playerToFire or not playerToFire.Parent then warn("RoSocketServiceHandler: Player for request no longer valid or left:", playerToFire and playerToFire.Name or "Unknown"); if systemRequestId then pendingClientRequests[systemRequestId] = nil end; return end
+    local success, decoded = pcall(HttpService.JSONDecode, HttpService, message)
+	if not success then warn("RoSocketServiceHandler: Failed to decode JSON:", message, decoded); return end
+
+	local playerToFire = nil
+    local originalRequestId = decoded.payload and decoded.payload.original_request_id
+    local systemRequestId = decoded.payload and (decoded.payload.system_request_id or decoded.payload.burst_id)
+
+    if originalRequestId and pendingClientRequests[originalRequestId] then
+        playerToFire = pendingClientRequests[originalRequestId].player
+        if systemRequestId and not pendingClientRequests[originalRequestId].system_request_id then
+             pendingClientRequests[originalRequestId].system_request_id = systemRequestId
+        end
+    elseif systemRequestId then 
+        for reqId, data in pairs(pendingClientRequests) do
+            if data.system_request_id == systemRequestId then
+                playerToFire = data.player
+                originalRequestId = reqId 
+                break
+            end
+        end
+    end
+    
+	if not playerToFire or not playerToFire.Parent then
+        warn("RoSocketServiceHandler: Could not map orchestrator message to player. OrigID:", originalRequestId or "N/A", "SysID:", systemRequestId or "N/A")
+        return
+    end
+
+    if originalRequestId and activeTrickTimeouts[originalRequestId] then
+        print("RoSocketServiceHandler: Gazebo responded for request", originalRequestId, ". Cancelling fallback timeout.")
+        task.cancel(activeTrickTimeouts[originalRequestId]); activeTrickTimeouts[originalRequestId] = nil
+    end
+
 	local messageType = decoded.type; local payload = decoded.payload
+    local cfm = serverFlightModels[playerToFire.UserId]
+    local guidanceCtrl = serverGuidanceControllers[playerToFire.UserId]
+
+    if not payload.original_request_id and originalRequestId then payload.original_request_id = originalRequestId end
+
 	if messageType == "TRICK_PENDING" then
-		if payload and payload.system_request_id and clientRequestInfo.original_client_request_id then pendingClientRequests[payload.system_request_id] = { player = playerToFire, original_client_request_id = clientRequestInfo.original_client_request_id }; print("RoSocketServiceHandler: Stored pending request mapping: SysID", payload.system_request_id, "-> ClientOrigID", clientRequestInfo.original_client_request_id)
-		else warn("RoSocketServiceHandler: TRICK_PENDING message missing system_request_id or original_request_id in existing info.") end
-	elseif messageType == "TRICK_DATA_START" then Remotes.TrickDataStarted:FireClient(playerToFire, payload); playerControlState[playerToFire.UserId] = "TrickMode"; print("RoSocketServiceHandler: Player", playerToFire.Name, "entering TrickMode (server state).")
-	elseif messageType == "TRICK_DATA_CHUNK" then Remotes.TrickDataChunk:FireClient(playerToFire, payload)
-	elseif messageType == "TRICK_DATA_END" then Remotes.TrickDataEnded:FireClient(playerToFire, payload); if systemRequestId then pendingClientRequests[systemRequestId] = nil end; playerControlState[playerToFire.UserId] = "PlayerControl"; print("RoSocketServiceHandler: Player", playerToFire.Name, "exiting TrickMode, back to PlayerControl (server state).")
-	elseif messageType == "TRICK_ERROR" then Remotes.TrickError:FireClient(playerToFire, payload); if systemRequestId then pendingClientRequests[systemRequestId] = nil end; playerControlState[playerToFire.UserId] = "PlayerControl"; warn("RoSocketServiceHandler: Player", playerToFire.Name, "exiting TrickMode due to error, back to PlayerControl (server state). Message:", payload and payload.message or "N/A")
-	elseif messageType == "CONFIGURE_DRONE_ACK" then Remotes.ConfigureDroneAck:FireClient(playerToFire, payload); if systemRequestId then pendingClientRequests[systemRequestId] = nil end
-	else warn("RoSocketServiceHandler: Received unknown message type from orchestrator:", messageType) end
+		print("RoSocketServiceHandler: TRICK_PENDING for player", playerToFire.Name, "SysID:", systemRequestId or "N/A")
+        if originalRequestId and pendingClientRequests[originalRequestId] and systemRequestId then
+            pendingClientRequests[originalRequestId].system_request_id = systemRequestId 
+        end
+	elseif messageType == "TRICK_DATA_START" then
+		if cfm and guidanceCtrl then
+            local drone = Workspace:FindFirstChild("PlayerDrone_" .. playerToFire.Name)
+            cfm:SetControlMode("Guidance")
+            guidanceCtrl:StartGuidance(payload.burst_id, {}, drone and drone.PrimaryPart and drone.PrimaryPart.CFrame or CFrame.new())
+			Remotes.ServerNotification:FireClient(playerToFire, {type="TrickStarted", original_request_id=originalRequestId, burst_id=payload.burst_id, source="Gazebo"})
+            print("RoSocketServiceHandler: Player", playerToFire.Name, "starting Gazebo-guided trick:", payload.burst_id)
+        end
+	elseif messageType == "TRICK_DATA_CHUNK" then
+		if guidanceCtrl and guidanceCtrl:IsActive() and guidanceCtrl.burstId == payload.burst_id then
+            guidanceCtrl.trajectoryFrames = payload.frames 
+        end
+	elseif messageType == "TRICK_DATA_END" then
+		if guidanceCtrl and guidanceCtrl:IsActive() and guidanceCtrl.burstId == payload.burst_id then
+            guidanceCtrl:EndGuidance(false)
+        end
+        if cfm then cfm:SetControlMode("Player") end
+		Remotes.ServerNotification:FireClient(playerToFire, {type="TrickEnded", original_request_id=originalRequestId, burst_id=payload.burst_id, success=true})
+        if originalRequestId then pendingClientRequests[originalRequestId] = nil end
+        print("RoSocketServiceHandler: Player", playerToFire.Name, "Gazebo trick ended:", payload.burst_id)
+	elseif messageType == "TRICK_ERROR" then
+		if guidanceCtrl and guidanceCtrl:IsActive() then guidanceCtrl:EndGuidance(true) end
+        if cfm then cfm:SetControlMode("Player") end
+		Remotes.ServerNotification:FireClient(playerToFire, {type="TrickEnded", original_request_id=originalRequestId, burst_id=(guidanceCtrl and guidanceCtrl.burstId or payload.burst_id), success=false, message=payload.message})
+        if originalRequestId then pendingClientRequests[originalRequestId] = nil end
+        warn("RoSocketServiceHandler: Player", playerToFire.Name, "Gazebo trick error. Msg:", payload and payload.message or "N/A")
+	elseif messageType == "CONFIGURE_DRONE_ACK" then
+		Remotes.ConfigureDroneAck:FireClient(playerToFire, payload)
+        if originalRequestId then pendingClientRequests[originalRequestId] = nil end
+	else warn("RoSocketServiceHandler: Unknown message type:", messageType) end
 end
 
 function RoSocketServiceHandler:Init()
-	coroutine.wrap(connectToOrchestrator)(); print("RoSocketServiceHandler: Initiated orchestrator connection attempt. Server-side physics ENABLED.")
-	local function _setupPlayerFlightModel(player)
+    coroutine.wrap(connectToOrchestrator)()
+	local function _setupPlayerControllers(player)
 		local playerDrone = Workspace:FindFirstChild("PlayerDrone_" .. player.Name)
 		if playerDrone then
-			print("RoSocketServiceHandler: PlayerDrone found for player", player.Name)
 			local cfmInstance = CustomFlightModel.new(playerDrone)
 			if cfmInstance then
 				serverFlightModels[player.UserId] = cfmInstance
 				playerLatestInputs[player.UserId] = { throttle = 0, roll = 0, pitch = 0, yaw = 0 }
-				playerControlState[player.UserId] = "PlayerControl"
-				print("RoSocketServiceHandler: Initialized SERVER-SIDE CustomFlightModel for player", player.Name)
-			else warn("RoSocketServiceHandler: Failed to initialize SERVER-SIDE CustomFlightModel for player", player.Name) end
-		else warn("RoSocketServiceHandler: Drone for player", player.Name, "not found. SERVER CFM not initialized.") end
+                local guidanceCtrl = ServerDroneGuidance.new(playerDrone, cfmInstance)
+                if guidanceCtrl then serverGuidanceControllers[player.UserId] = guidanceCtrl end
+				print("RoSocketServiceHandler: Initialized Server CFM & Guidance for player", player.Name)
+			else warn("RoSocketServiceHandler: Failed to initialize Server CFM for", player.Name) end
+		else warn("RoSocketServiceHandler: Drone for", player.Name, "not found. Controllers not initialized.") end
 	end
-	Players.PlayerAdded:Connect(function(player) activePlayersByUserId[player.UserId] = player; print("RoSocketServiceHandler: Player added to active list:", player.Name, player.UserId); _setupPlayerFlightModel(player) end)
-	for _, player in ipairs(Players:GetPlayers()) do activePlayersByUserId[player.UserId] = player; _setupPlayerFlightModel(player) end
+	Players.PlayerAdded:Connect(function(player) activePlayersByUserId[player.UserId] = player; _setupPlayerControllers(player) end)
+	for _, player in ipairs(Players:GetPlayers()) do activePlayersByUserId[player.UserId] = player; _setupPlayerControllers(player) end
+
 	Remotes.RequestTrick.OnServerInvoke = function(player, clientPayload)
-		if socketConnection and socketConnection.Send then
-			print("RoSocketServiceHandler: Forwarding REQUEST_TRICK from Player", player.UserId, "OrigReqID:", clientPayload.original_request_id)
-			local serverPayload = {type = "REQUEST_TRICK", payload = { roblox_client_id = tostring(player.UserId), original_request_id = clientPayload.original_request_id, drone_name = clientPayload.drone_name, trick_type = clientPayload.trick_type, direction = clientPayload.direction, initial_state = clientPayload.initial_state }}
-			local success, err = pcall(socketConnection.Send, socketConnection, HttpService:JSONEncode(serverPayload))
-			if success then return { success = true, message = "Request forwarded to orchestrator." }
-			else warn("RoSocketServiceHandler: Error sending RequestTrick:", err); return { success = false, error = "Failed to send request to orchestrator: " .. tostring(err) } end
-		else warn("RoSocketServiceHandler: Cannot forward RequestTrick, RoSocket not connected. State:", socketConnection and socketConnection.readyState or "nil"); return { success = false, error = "Not connected to orchestration server." } end
+        local cfm = serverFlightModels[player.UserId]
+        local guidanceCtrl = serverGuidanceControllers[player.UserId]
+        local originalRequestId = clientPayload.original_request_id 
+
+		if not (cfm and guidanceCtrl and Workspace:FindFirstChild("PlayerDrone_" .. player.Name)) then
+            warn("RoSocketServiceHandler:RequestTrick - Missing server components for player", player.Name)
+            return { success = false, error = "Server components not ready." }
+        end
+        if guidanceCtrl:IsActive() or activeTrickTimeouts[originalRequestId] or pendingClientRequests[originalRequestId] or activeReorientations[player.UserId] then
+            warn("RoSocketServiceHandler:RequestTrick - Player", player.Name, "operation already processing for OrigID:", originalRequestId, "Ignoring.")
+            return { success = false, error = "Operation already active or being processed for this request ID." }
+        end
+
+        cfm:SetControlMode("Guidance")
+		Remotes.ServerNotification:FireClient(player, {type="TrickAttempting", original_request_id=originalRequestId})
+        print("RoSocketServiceHandler: Player", player.Name, "REQUEST_TRICK. OrigID:", originalRequestId)
+        pendingClientRequests[originalRequestId] = {player = player, isGazeboAttempted = false, clientPayload = clientPayload}
+
+		if socketConnection and socketConnection.readyState == "OPEN" then
+			local serverPayload = {type = "REQUEST_TRICK", payload = clientPayload}
+            serverPayload.payload.roblox_client_id = tostring(player.UserId)
+            pendingClientRequests[originalRequestId].isGazeboAttempted = true
+
+			local successSend, errSend = pcall(socketConnection.Send, socketConnection, HttpService:JSONEncode(serverPayload))
+			if successSend then
+                if activeTrickTimeouts[originalRequestId] then task.cancel(activeTrickTimeouts[originalRequestId]) end 
+                activeTrickTimeouts[originalRequestId] = task.delay(FALLBACK_TIMEOUT_DURATION, function()
+                    if pendingClientRequests[originalRequestId] and not (guidanceCtrl and guidanceCtrl:IsActive()) then 
+                        initiateServerFallback(player, originalRequestId, "Gazebo timed out")
+                    end
+                    activeTrickTimeouts[originalRequestId] = nil
+                end)
+                return { success = true, message = "Request forwarded to orchestrator, awaiting response or fallback." }
+			else
+                warn("RoSocketServiceHandler: Error sending RequestTrick to RoSocket proxy:", errSend, ". Initiating server fallback.")
+                initiateServerFallback(player, originalRequestId, "Failed to send to orchestrator")
+                return { success = true, message = "Failed to send to orchestrator, initiated server fallback." } 
+            end
+		else
+            warn("RoSocketServiceHandler: RoSocket not connected. Initiating server fallback immediately for OrigID:", originalRequestId)
+            initiateServerFallback(player, originalRequestId, "RoSocket not connected")
+            return { success = true, message = "RoSocket not connected, initiated server fallback." } 
+        end
 	end
+
+    Remotes.RequestReorient.OnServerInvoke = function(player)
+        local cfm = serverFlightModels[player.UserId]
+        local guidanceCtrl = serverGuidanceControllers[player.UserId]
+        local drone = Workspace:FindFirstChild("PlayerDrone_" .. player.Name)
+
+        if not (cfm and guidanceCtrl and drone and drone.PrimaryPart) then
+            return { success = false, error = "Server components not ready for reorient." }
+        end
+        if guidanceCtrl:IsActive() or activeReorientations[player.UserId] then
+            local activeReq = "Unknown"
+            for reqId, data in pairs(pendingClientRequests) do if data.player == player then activeReq = reqId; break; end end
+            warn("RoSocketServiceHandler:Reorient - Player", player.Name, "another operation active (TrickID:", activeReq, "Reorienting:", tostring(activeReorientations[player.UserId]),"). Ignoring.")
+            return { success = false, error = "Another operation (trick/reorient) is active."}
+        end
+
+        print("RoSocketServiceHandler: Player", player.Name, "requested reorient.")
+        activeReorientations[player.UserId] = true 
+        cfm:SetControlMode("Guidance") 
+
+        local currentCFrame = drone.PrimaryPart.CFrame
+        local _, yaw, _ = currentCFrame:ToOrientation() 
+        local targetHomeCFrame = CFrame.new(currentCFrame.Position) * CFrame.Angles(0, yaw, 0) 
+
+        local reorientFrames = {
+            {t = 0, cframe = currentCFrame, lin_vel = {0,0,0}, ang_vel = {0,0,0}}, 
+            {t = Config.REORIENT_DURATION, cframe = targetHomeCFrame, lin_vel = {0,0,0}, ang_vel = {0,0,0}} 
+        }
+        local reorientBurstId = "server_reorient_" .. HttpService:GenerateGUID(false)
+        guidanceCtrl:StartGuidance(reorientBurstId, reorientFrames, currentCFrame) 
+
+        Remotes.ServerNotification:FireClient(player, {type="ReorientStarted", burst_id=reorientBurstId})
+        
+        return { success = true, message = "Reorientation started."}
+    end
+
 	Remotes.ConfigureDrone.OnServerInvoke = function(player, clientPayload)
 		if socketConnection and socketConnection.Send then
-			print("RoSocketServiceHandler: Forwarding CONFIGURE_DRONE from Player", player.UserId)
-			local serverPayload = {type = "CONFIGURE_DRONE", payload = { roblox_client_id = tostring(player.UserId), original_request_id = clientPayload.original_request_id, drone_params = clientPayload.drone_params}}
-			local success, err = pcall(socketConnection.Send, socketConnection, HttpService:JSONEncode(serverPayload))
-			if success then return { success = true, message = "Configuration request forwarded." }
-			else warn("RoSocketServiceHandler: Error sending ConfigureDrone:", err); return { success = false, error = "Failed to send configuration request: " .. tostring(err) } end
-		else warn("RoSocketServiceHandler: Cannot forward ConfigureDrone, RoSocket not connected."); return { success = false, error = "Not connected to orchestration server." } end
+			local serverPayload = {type = "CONFIGURE_DRONE", payload = clientPayload}
+            serverPayload.payload.roblox_client_id = tostring(player.UserId)
+			local s,e = pcall(socketConnection.Send, socketConnection, HttpService:JSONEncode(serverPayload))
+			if s then 
+                pendingClientRequests[clientPayload.original_request_id] = {player=player, clientPayload = clientPayload}
+                return {success=true} 
+            else 
+                return {success=false, error=tostring(e)} 
+            end
+		else return {success=false, error="Not connected."} end
 	end
-	print("RoSocketServiceHandler: OnServerInvoke handlers set up.")
+
 	Remotes.ClientDroneInputs.OnServerEvent:Connect(function(player, inputs)
-		if serverFlightModels[player.UserId] and inputs then
-			playerLatestInputs[player.UserId] = inputs
-            -- SERVER DEBUG: Log received inputs from client
-            -- print(string.format("SERVER RoSocket: Received inputs from %s: T:%.2f R:%.2f P:%.2f Y:%.2f",
-            --    player.Name, inputs.throttle, inputs.roll, inputs.pitch, inputs.yaw))
-		end
+		if serverFlightModels[player.UserId] and inputs then playerLatestInputs[player.UserId] = inputs end
 	end)
+
 	RunService.Heartbeat:Connect(function(deltaTime)
 		for userId, cfmInstance in pairs(serverFlightModels) do
 			local player = activePlayersByUserId[userId]
+            local guidanceCtrl = serverGuidanceControllers[userId]
 			if not player or not cfmInstance.IsInitialized then continue end
-			local currentDrone = Workspace:FindFirstChild("PlayerDrone_" .. player.Name)
-			if not currentDrone or not currentDrone.PrimaryPart then continue end
-			if currentDrone.PrimaryPart.Anchored then if RunService:IsStudio() and math.random() < 0.01 then print("RoSocketServiceHandler: Server Heartbeat - Drone", currentDrone.Name, "is ANCHORED. Skipping physics update.") end; continue end
 			
-			if playerControlState[userId] == "PlayerControl" then
-				local inputs = playerLatestInputs[userId]
-				if inputs then
-                    -- SERVER DEBUG: Log inputs being USED for CFM:Update
-                    -- if inputs.roll ~= 0 or inputs.pitch ~= 0 or inputs.yaw ~= 0 then
-                    --    print(string.format("SERVER RoSocket: USING inputs for %s: T:%.2f R:%.2f P:%.2f Y:%.2f",
-                    --        player.Name, inputs.throttle, inputs.roll, inputs.pitch, inputs.yaw))
-                    -- end
-					cfmInstance:Update(deltaTime, inputs.throttle, inputs.roll, inputs.pitch, inputs.yaw)
-				else
-					cfmInstance:Update(deltaTime, 0, 0, 0, 0)
-				end
-			elseif playerControlState[userId] == "TrickMode" then
-                cfmInstance:Update(deltaTime, 0,0,0,0)
-			end
+            if cfmInstance.ControlMode == "Player" then
+			    local inputs = playerLatestInputs[userId] or { throttle = 0, roll = 0, pitch = 0, yaw = 0 }
+			    cfmInstance:Update(deltaTime, inputs.throttle, inputs.roll, inputs.pitch, inputs.yaw)
+            elseif cfmInstance.ControlMode == "Guidance" and guidanceCtrl and guidanceCtrl:IsActive() then
+                local stillGuiding = guidanceCtrl:Update(deltaTime)
+                if not stillGuiding then
+                    local completedBurstId = guidanceCtrl.burstId 
+                    local originalReqIdForCompletedBurst = nil
+                    local isReorient = string.sub(completedBurstId or "", 1, 16) == "server_reorient_"
+
+                    for reqId, data in pairs(pendingClientRequests) do
+                        if data.system_request_id == completedBurstId then
+                            originalReqIdForCompletedBurst = reqId
+                            pendingClientRequests[reqId] = nil; 
+                            break
+                        end
+                    end
+                    
+                    guidanceCtrl:EndGuidance(false) 
+                    cfmInstance:SetControlMode("Player")
+
+                    if isReorient then
+                        Remotes.ServerNotification:FireClient(player, {type="ReorientComplete", burst_id=completedBurstId, success=true})
+                        activeReorientations[player.UserId] = nil 
+                        print("RoSocketServiceHandler: Server Reorientation completed for", player.Name)
+                    else
+                        Remotes.ServerNotification:FireClient(player, {type="TrickEnded", original_request_id=originalReqIdForCompletedBurst, burst_id=completedBurstId, success=true})
+                        print("RoSocketServiceHandler: ServerDroneGuidance (Trick) completed for", player.Name, "Burst:", completedBurstId)
+                    end
+                end
+            end
 		end
 	end)
-	print("RoSocketServiceHandler: Server-side physics Heartbeat loop started. Player inputs will drive server CFM.")
+	print("RoSocketServiceHandler: Initialized.")
 end
 
 function RoSocketServiceHandler:PlayerRemoved(player)
 	if player and activePlayersByUserId[player.UserId] then
-		activePlayersByUserId[player.UserId] = nil; print("RoSocketServiceHandler: Player removed from active list:", player.Name, player.UserId)
-		local requestsToClean = {}; for reqId, data in pairs(pendingClientRequests) do if data.player == player then table.insert(requestsToClean, reqId) end end
-		for _, reqId in ipairs(requestsToClean) do pendingClientRequests[reqId] = nil; print("RoSocketServiceHandler: Cleaned pending request", reqId, "for removed player", player.Name) end
-		local cfmInstance = serverFlightModels[player.UserId]
-		if cfmInstance then
-			print("RoSocketServiceHandler: Cleaning up server-side CustomFlightModel for removed player", player.Name)
-			if typeof(cfmInstance.Cleanup) == "function" then cfmInstance:Cleanup() else warn("RoSocketServiceHandler: CustomFlightModel instance for", player.Name, "does not have a Cleanup method.") end
-			serverFlightModels[player.UserId] = nil
-		end
-		if playerLatestInputs[player.UserId] then playerLatestInputs[player.UserId] = nil; print("RoSocketServiceHandler: Cleaned up latest inputs for removed player", player.Name) end
-		if playerControlState[player.UserId] then playerControlState[player.UserId] = nil; print("RoSocketServiceHandler: Cleaned up control state for removed player", player.Name) end
+		activePlayersByUserId[player.UserId] = nil
+		local cfm = serverFlightModels[player.UserId]; if cfm then cfm:Cleanup(); serverFlightModels[player.UserId] = nil end
+        local gCtrl = serverGuidanceControllers[player.UserId]; if gCtrl then gCtrl:EndGuidance(true); serverGuidanceControllers[player.UserId] = nil end
+		playerLatestInputs[player.UserId] = nil
+        activeReorientations[player.UserId] = nil 
+        local reqsToClean = {}
+        for reqId, data in pairs(pendingClientRequests) do if data.player == player then table.insert(reqsToClean, reqId) end end
+        for _, reqId in ipairs(reqsToClean) do 
+            if activeTrickTimeouts[reqId] then task.cancel(activeTrickTimeouts[reqId]); activeTrickTimeouts[reqId] = nil end
+            pendingClientRequests[reqId] = nil
+        end
+		print("RoSocketServiceHandler: Cleaned up for removed player", player.Name)
 	end
 end
 

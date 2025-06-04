@@ -23,7 +23,9 @@ end
 
 Remotes.RequestTrick = getOrCreateRemote("RequestTrick", "RemoteFunction")
 Remotes.ConfigureDrone = getOrCreateRemote("ConfigureDrone", "RemoteFunction")
-Remotes.RequestAssistance = getOrCreateRemote("RequestAssistance", "RemoteFunction") -- NEW FOR LATER
+Remotes.RequestReorient = getOrCreateRemote("RequestReorient", "RemoteFunction") 
+
+Remotes.ServerNotification = getOrCreateRemote("ServerNotification", "RemoteEvent")
 
 Remotes.TrickDataStarted = getOrCreateRemote("TrickDataStarted", "RemoteEvent")
 Remotes.TrickDataChunk = getOrCreateRemote("TrickDataChunk", "RemoteEvent")
@@ -31,16 +33,6 @@ Remotes.TrickDataEnded = getOrCreateRemote("TrickDataEnded", "RemoteEvent")
 Remotes.TrickError = getOrCreateRemote("TrickError", "RemoteEvent")
 Remotes.ConfigureDroneAck = getOrCreateRemote("ConfigureDroneAck", "RemoteEvent")
 
-Remotes.AssistanceDataStarted = getOrCreateRemote("AssistanceDataStarted", "RemoteEvent") -- NEW FOR LATER
-Remotes.AssistanceDataChunk = getOrCreateRemote("AssistanceDataChunk", "RemoteEvent") -- NEW FOR LATER
-Remotes.AssistanceDataEnded = getOrCreateRemote("AssistanceDataEnded", "RemoteEvent") -- NEW FOR LATER
-Remotes.AssistanceError = getOrCreateRemote("AssistanceError", "RemoteEvent") -- NEW FOR LATER
-
-Remotes.ServerNotification = getOrCreateRemote("ServerNotification", "RemoteEvent")
-
--- OLD: Remotes.SendDroneInputsEvent = getOrCreateRemote("SendDroneInputsEvent", "RemoteEvent") -- For client to send drone flight inputs
--- NEW: Remote for client to send drone flight inputs to server for server-side physics
 Remotes.ClientDroneInputs = getOrCreateRemote("ClientDroneInputs", "RemoteEvent")
-
 
 return Remotes
