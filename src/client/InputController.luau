@@ -10,9 +10,9 @@ local _Remotes = require(ReplicatedStorage.Shared.Remotes)
 local InputController = {}
 InputController.InputState = {throttle = 0, roll = 0, pitch = 0, yaw = 0}
 InputController.activeKeyboardInputs = { 
-    YawLeft = false, YawRight = false,
-    PitchForward = false, PitchBackward = false,
-    RollLeft = false, RollRight = false
+    YawLeft = false, YawRight = false,       -- 'A' key, 'D' key
+    PitchForward = false, PitchBackward = false, -- 'UpArrow' key, 'DownArrow' key
+    RollLeft = false, RollRight = false        -- 'LeftArrow' key, 'RightArrow' key
 }
 InputController.TrickButtonPressed = Instance.new("BindableEvent")
 InputController.ReorientButtonPressed = Instance.new("BindableEvent") 
@@ -88,19 +88,29 @@ end
 
 function InputController:handleKeyboardFlightControlAction(actionName, inputState, inputObject)
     local isBegin = (inputState == Enum.UserInputState.Begin)
-    if self.activeKeyboardInputs[actionName] ~= nil then self.activeKeyboardInputs[actionName] = isBegin
-    else return Enum.ContextActionResult.Pass end
+    if self.activeKeyboardInputs[actionName] ~= nil then
+        self.activeKeyboardInputs[actionName] = isBegin
+    else
+        warn("InputController:handleKeyboardFlightControlAction - Unknown actionName:", actionName)
+        return Enum.ContextActionResult.Pass
+    end
     
-    if self.activeKeyboardInputs.YawLeft and not self.activeKeyboardInputs.YawRight then self.InputState.yaw = -1
-    elseif self.activeKeyboardInputs.YawRight and not self.activeKeyboardInputs.YawLeft then self.InputState.yaw = 1
+    -- Yaw: 'A' for Yaw Right, 'D' for Yaw Left.
+    -- InputState.yaw: Positive for Yaw Right, Negative for Yaw Left.
+    if self.activeKeyboardInputs.YawLeft and not self.activeKeyboardInputs.YawRight then self.InputState.yaw = 1  -- 'A' key = Yaw Right
+    elseif self.activeKeyboardInputs.YawRight and not self.activeKeyboardInputs.YawLeft then self.InputState.yaw = -1 -- 'D' key = Yaw Left
     else self.InputState.yaw = 0 end 
 
-    if self.activeKeyboardInputs.PitchForward and not self.activeKeyboardInputs.PitchBackward then self.InputState.pitch = 1
-    elseif self.activeKeyboardInputs.PitchBackward and not self.activeKeyboardInputs.PitchForward then self.InputState.pitch = -1
+    -- Pitch: 'UpArrow' for Pitch Up, 'DownArrow' for Pitch Down.
+    -- InputState.pitch: Positive for Pitch Up, Negative for Pitch Down.
+    if self.activeKeyboardInputs.PitchForward and not self.activeKeyboardInputs.PitchBackward then self.InputState.pitch = 1  -- 'UpArrow' key = Pitch Up
+    elseif self.activeKeyboardInputs.PitchBackward and not self.activeKeyboardInputs.PitchForward then self.InputState.pitch = -1 -- 'DownArrow' key = Pitch Down
     else self.InputState.pitch = 0 end
 
-    if self.activeKeyboardInputs.RollLeft and not self.activeKeyboardInputs.RollRight then self.InputState.roll = -1
-    elseif self.activeKeyboardInputs.RollRight and not self.activeKeyboardInputs.RollLeft then self.InputState.roll = 1
+    -- Roll: 'LeftArrow' for Roll Right, 'RightArrow' for Roll Left.
+    -- InputState.roll: Positive for Roll Right, Negative for Roll Left.
+    if self.activeKeyboardInputs.RollLeft and not self.activeKeyboardInputs.RollRight then self.InputState.roll = 1  -- 'LeftArrow' key = Roll Right
+    elseif self.activeKeyboardInputs.RollRight and not self.activeKeyboardInputs.RollLeft then self.InputState.roll = -1 -- 'RightArrow' key = Roll Left
     else self.InputState.roll = 0 end
     
     return Enum.ContextActionResult.Pass
@@ -108,12 +118,12 @@ end
 
 local function handleGamepadInput(actionName, inputState, inputObject: InputObject)
     if inputObject.UserInputType == Enum.UserInputType.Gamepad1 then
-        if inputObject.KeyCode == Enum.KeyCode.ButtonL3 then
-            gamepadThrottle = -inputObject.Position.Y 
-            gamepadYaw = inputObject.Position.X
-        elseif inputObject.KeyCode == Enum.KeyCode.ButtonR3 then
-            gamepadPitch = -inputObject.Position.Y 
-            gamepadRoll = inputObject.Position.X
+        if inputObject.KeyCode == Enum.KeyCode.ButtonL3 then -- Left Stick
+            gamepadThrottle = -inputObject.Position.Y -- Stick Up (Y negative) -> positive throttle value for calculation
+            gamepadYaw = inputObject.Position.X      -- Stick Right (X positive) -> positive raw yaw input
+        elseif inputObject.KeyCode == Enum.KeyCode.ButtonR3 then -- Right Stick
+            gamepadPitch = -inputObject.Position.Y -- Stick Up (Y negative) -> positive raw pitch input
+            gamepadRoll = inputObject.Position.X   -- Stick Right (X positive) -> positive raw roll input
         elseif inputObject.KeyCode == Enum.KeyCode.ButtonA and inputState == Enum.UserInputState.Begin then
             local currentTime = tick()
             if currentTime - lastReorientPressTime < REORIENT_DEBOUNCE_TIME then return Enum.ContextActionResult.Pass end
@@ -143,12 +153,17 @@ function InputController:Initialize()
 	ContextActionService:BindAction("TriggerTrick2_Num2", handleTrickButton, false, Enum.KeyCode.Two)
     ContextActionService:BindAction("ReorientDrone", handleReorientButton, false, Enum.KeyCode.F) 
     
-	ContextActionService:BindAction("YawLeft",       function(...) self:handleKeyboardFlightControlAction(...) end, false, Enum.KeyCode.A)
-	ContextActionService:BindAction("YawRight",      function(...) self:handleKeyboardFlightControlAction(...) end, false, Enum.KeyCode.D)
-	ContextActionService:BindAction("PitchForward",  function(...) self:handleKeyboardFlightControlAction(...) end, false, Enum.KeyCode.Up)
-	ContextActionService:BindAction("PitchBackward", function(...) self:handleKeyboardFlightControlAction(...) end, false, Enum.KeyCode.Down)
-	ContextActionService:BindAction("RollLeft",      function(...) self:handleKeyboardFlightControlAction(...) end, false, Enum.KeyCode.Left)
-	ContextActionService:BindAction("RollRight",     function(...) self:handleKeyboardFlightControlAction(...) end, false, Enum.KeyCode.Right)
+    local flightControlHandler = function(actionName, inputState, inputObject)
+        return self:handleKeyboardFlightControlAction(actionName, inputState, inputObject)
+    end
+    
+    -- Action names for binding correspond to keys in `activeKeyboardInputs`
+	ContextActionService:BindAction("YawLeft",       flightControlHandler, false, Enum.KeyCode.A)          -- 'A' key
+	ContextActionService:BindAction("YawRight",      flightControlHandler, false, Enum.KeyCode.D)          -- 'D' key
+	ContextActionService:BindAction("PitchForward",  flightControlHandler, false, Enum.KeyCode.Up)         -- 'UpArrow' key
+	ContextActionService:BindAction("PitchBackward", flightControlHandler, false, Enum.KeyCode.Down)       -- 'DownArrow' key
+	ContextActionService:BindAction("RollLeft",      flightControlHandler, false, Enum.KeyCode.Left)       -- 'LeftArrow' key
+	ContextActionService:BindAction("RollRight",     flightControlHandler, false, Enum.KeyCode.Right)      -- 'RightArrow' key
     
     ContextActionService:BindAction("GamepadFlightControls", handleGamepadInput, false, 
         Enum.UserInputType.Gamepad1) 
@@ -173,15 +188,36 @@ function InputController:Initialize()
 end
 
 function InputController:GetInputs()
-    local finalThrottle, finalRoll, finalPitch, finalYaw = 
-        currentKeyboardThrottleLevel, self.InputState.roll, self.InputState.pitch, self.InputState.yaw
+    local finalThrottle, finalRoll, finalPitch, finalYaw
 
     if gamepadConnected then
         local deadzone = 0.15
-        if math.abs(gamepadThrottle) > deadzone then finalThrottle = (gamepadThrottle + 1) / 2 end 
-        if math.abs(gamepadRoll) > deadzone then finalRoll = gamepadRoll end
-        if math.abs(gamepadPitch) > deadzone then finalPitch = gamepadPitch end
-        if math.abs(gamepadYaw) > deadzone then finalYaw = gamepadYaw end
+        
+        -- Throttle: Left stick Y. gamepadThrottle is -inputObject.Position.Y.
+        -- Stick Up (Y negative) -> gamepadThrottle positive raw.
+        -- (gamepadThrottle + 1) / 2 maps raw [-1, 1] to final [0, 1]. Correct.
+        if math.abs(gamepadThrottle) > deadzone then finalThrottle = (gamepadThrottle + 1) / 2 else finalThrottle = currentKeyboardThrottleLevel end
+        
+        -- Roll: Right stick X. gamepadRoll is inputObject.Position.X.
+        -- Stick Right (X positive) -> gamepadRoll positive raw.
+        -- finalRoll should be positive for Roll Right. This is correct.
+        if math.abs(gamepadRoll) > deadzone then finalRoll = gamepadRoll else finalRoll = self.InputState.roll end
+
+        -- Pitch: Right stick Y. gamepadPitch is -inputObject.Position.Y.
+        -- Stick Up (Y negative) -> gamepadPitch positive raw.
+        -- finalPitch should be positive for Pitch Up. This is correct as gamepadPitch is positive for stick up.
+        if math.abs(gamepadPitch) > deadzone then finalPitch = gamepadPitch else finalPitch = self.InputState.pitch end
+        
+        -- Yaw: Left stick X. gamepadYaw is inputObject.Position.X.
+        -- Stick Right (X positive) -> gamepadYaw positive raw.
+        -- finalYaw should be positive for Yaw Right. This is correct.
+        if math.abs(gamepadYaw) > deadzone then finalYaw = gamepadYaw else finalYaw = self.InputState.yaw end
+        
+    else
+        finalThrottle = currentKeyboardThrottleLevel
+        finalRoll = self.InputState.roll
+        finalPitch = self.InputState.pitch
+        finalYaw = self.InputState.yaw
     end
     
 	return {

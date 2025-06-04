@@ -163,14 +163,25 @@ function CustomFlightModel:Update(deltaTime, inputThrottle, inputRoll, inputPitc
 	local currentAngVelLocal = currentCFrame:VectorToObjectSpace(currentAngVelWorld)
 	self.actualMassKg = self.droneBody:GetMass() 
 
-	local targetRollRate = inputRoll * Config.TARGET_ROLL_RATE_MAX
-	local targetPitchRate = inputPitch * Config.TARGET_PITCH_RATE_MAX
-	local targetYawRate = inputYaw * Config.TARGET_YAW_RATE_MAX
-	local targetAngVelLocal = Vector3.new(targetRollRate, targetPitchRate, targetYawRate)
+	-- Calculate desired angular rates based on input
+	-- InputState values are expected as:
+	-- inputPitch: positive for Nose Up, negative for Nose Down
+	-- inputYaw:   positive for Yaw Right, negative for Yaw Left
+	-- inputRoll:  positive for Roll Right, negative for Roll Left
+	local desiredPitchRate = inputPitch * Config.TARGET_PITCH_RATE_MAX
+	local desiredYawRate   = inputYaw   * Config.TARGET_YAW_RATE_MAX
+	local desiredRollRate  = inputRoll  * Config.TARGET_ROLL_RATE_MAX
+
+	-- Construct the target local angular velocity vector.
+	-- This maps commands to standard body axes for torque application:
+	-- X-axis (RightVector): Pitching motion. Positive = Nose Up.
+	-- Y-axis (UpVector):    Yawing motion. Positive = Yaw Right.
+	-- Z-axis (BackVector):  Rolling motion. Positive = Roll Right.
+	local targetAngVelLocal = Vector3.new(desiredPitchRate, desiredYawRate, desiredRollRate)
 
 	local errorAngVelLocal = targetAngVelLocal - currentAngVelLocal
 	local pTorqueLocal = errorAngVelLocal * Config.ATTITUDE_P_GAIN
-	local dTorqueLocal = -currentAngVelLocal * Config.ATTITUDE_D_GAIN 
+	local dTorqueLocal = -currentAngVelLocal * Config.ATTITUDE_D_GAIN -- Damping term
 	local netTorqueLocal = pTorqueLocal + dTorqueLocal
 	local netTorqueWorld = currentCFrame:VectorToWorldSpace(netTorqueLocal)
 
