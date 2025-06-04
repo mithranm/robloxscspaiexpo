@@ -1,0 +1,15 @@
+# Project place file
+/robloxscspaiexpo.rbxlx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+# Wally lock files
+/wally.lock
+
+# Mithran
+codebase_snapshot.md
+changes.md
+
+Packages/
