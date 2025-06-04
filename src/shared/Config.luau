@@ -17,13 +17,13 @@ Config.TARGET_PITCH_RATE_MAX = math.rad(180)
 Config.TARGET_ROLL_RATE_MAX = math.rad(180)  
 Config.TARGET_YAW_RATE_MAX = math.rad(120)   
 
--- ADJUSTED GAINS: These were likely too low previously.
-Config.ATTITUDE_P_GAIN = 0.05  -- Significantly increased P-Gain for responsiveness (was 0.0001)
-Config.ATTITUDE_D_GAIN = 0.005     -- Added some D-Gain for damping (was 0.0)
+-- ADJUSTED GAINS FOR MORE STABILITY:
+Config.ATTITUDE_P_GAIN = 0.03  -- Reduced P-Gain slightly for less aggressive initial response
+Config.ATTITUDE_D_GAIN = 0.015     -- Increased D-Gain significantly for more damping
 
 Config.DRAG_COEFFICIENT_LINEAR = 0.08    
 Config.DRAG_COEFFICIENT_QUADRATIC = 0.05 
-Config.DRAG_COEFFICIENT_ANGULAR = 0.02   
+Config.DRAG_COEFFICIENT_ANGULAR = 0.15   -- Increased angular drag for more natural resistance to rotation
 
 -- Safe Envelope 
 Config.MAX_SAFE_ATTITUDE_DEGREES = 75
@@ -38,10 +38,5 @@ Config.GUIDANCE_ROT_KP = 40
 Config.GUIDANCE_ROT_KD = 5  
 
 Config.TRICK_ACTIVATION_DELAY = 0.5
-
--- Input Configuration (Gamepad/Touch related constants removed)
--- Config.INPUT_DEADZONE_STICK = 0.15 -- REMOVED
--- Config.TOUCH_STICK_SENSITIVITY = 1.0 -- REMOVED (not used for flight)
--- Config.GAMEPAD_STICK_SENSITIVITY = 1.0 -- REMOVED
 
 return Config
