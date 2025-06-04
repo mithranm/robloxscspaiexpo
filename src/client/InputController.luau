@@ -35,11 +35,14 @@ local player
 
 local function handleTrickButton(actionName, inputState, inputObject)
     if inputState == Enum.UserInputState.Begin then
+        print("InputController: handleTrickButton - Action:", actionName, "State:", inputState) -- ADDED DEBUG
         if actionName == "TriggerTrick1_Num1" then 
             InputController.TrickButtonPressed:Fire("barrel_roll", "RIGHT")
+            print("InputController: Fired TrickButtonPressed for barrel_roll RIGHT") -- ADDED DEBUG
             return Enum.ContextActionResult.Sink
         elseif actionName == "TriggerTrick2_Num2" then 
             InputController.TrickButtonPressed:Fire("barrel_roll", "LEFT")
+            print("InputController: Fired TrickButtonPressed for barrel_roll LEFT") -- ADDED DEBUG
             return Enum.ContextActionResult.Sink
         end
     end
@@ -153,7 +156,6 @@ function InputController:Initialize()
 end
 
 function InputController:GetInputs()
-    -- This now purely reflects keyboard state.
     print(string.format("InputController:GetInputs() returning -> T:%.2f R:%.2f P:%.2f Y:%.2f",
        currentThrottleLevel, self.InputState.roll, self.InputState.pitch, self.InputState.yaw))
 

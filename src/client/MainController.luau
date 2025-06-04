@@ -4,42 +4,74 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local _StarterGui = game:GetService("StarterGui")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService") -- Added for GenerateGUID
 
 local _Config = require(ReplicatedStorage.Shared.Config)
 local _Remotes = require(ReplicatedStorage.Shared.Remotes)
 local ClientToServerBridge = require(script.Parent.ClientToServerBridge)
 local DroneViewController = require(script.Parent.DroneViewController)
--- CustomFlightModel is no longer directly used by client MainController for physics
--- local CustomFlightModel = require(ReplicatedStorage.Shared.DronePhysics.CustomFlightModel)
 local TrickGuidanceController = require(ReplicatedStorage.Shared.DronePhysics.TrickGuidanceController)
 
 local MainController = {}
 
 local player = nil
 local MyDrone = nil
-local MyDroneBody = nil -- Store the drone's body part
+local MyDroneBody = nil 
 local myGazeboDroneName = nil
 
-local currentMode = "PlayerControl" -- Modes: PlayerControl, TrickMode
-local currentOriginalRequestId = nil
+local currentMode = "PlayerControl" 
+local currentOriginalRequestId = nil -- Stores the ID of the currently active trick request
 local droneInitialized = false
 
 local heartbeatConnection = nil
 local renderSteppedConnection = nil
+local trickRequestTimeoutTask = nil -- To manage the timeout for REQUEST_TRICK
 
 local inputControllerRef = nil
--- local flightModelInstance = nil -- Client no longer manages its own physics-applying flight model instance
 
 local lastHeartbeatLogTime = 0
 local heartbeatLogInterval = 1
 
--- Helper function to get current drone state directly from the model
+-- Define a simple pre-programmed barrel roll trajectory
+local function generatePreProgrammedBarrelRoll(startCFrame: CFrame, direction: string, duration: number, steps: number)
+	local frames = {}
+	local totalRotation = math.rad(360) * (direction == "LEFT" and 1 or -1)
+	local forwardMovementPerSecond = 2.5 -- meters per second forward
+	
+	local rollAxisWorld = startCFrame.LookVector 
+    
+    local worldAngVel = rollAxisWorld * (totalRotation / duration)
+
+	for i = 0, steps do
+		local t = (i / steps) * duration
+		local fraction = i / steps
+
+        local currentRotationDelta = CFrame.fromAxisAngle(rollAxisWorld, totalRotation * fraction)
+		local targetOrientation = currentRotationDelta * startCFrame.Rotation
+		
+		local currentPosition = startCFrame.Position + startCFrame.LookVector * (forwardMovementPerSecond * t)
+		
+		local frameCFrame = CFrame.new(currentPosition) * targetOrientation
+        
+        local worldLinVel = startCFrame.LookVector * forwardMovementPerSecond
+
+		table.insert(frames, {
+			t = t,
+			cframe = frameCFrame, 
+			lin_vel = {worldLinVel.X, worldLinVel.Y, worldLinVel.Z},
+			ang_vel = {worldAngVel.X, worldAngVel.Y, worldAngVel.Z}, 
+		})
+	end
+	return frames
+end
+
+
 local function getDroneCurrentState(droneModel)
 	if not droneModel or not droneModel.PrimaryPart then
 		return {
 			cframe = CFrame.new(), position = Vector3.new(),
 			linear_velocity = Vector3.new(), angular_velocity = Vector3.new(),
-			mass_kg = _Config.DRONE_MASS_KG_DEFAULT, -- Fallback mass
+			mass_kg = _Config.DRONE_MASS_KG_DEFAULT, 
             isStable = false, breachReason = "NO_MODEL_PRIMARYPART"
 		}
 	end
@@ -88,7 +120,7 @@ local function findPlayerDroneAndInitialize()
 	end
 
 	MyDrone = droneInstance
-	MyDroneBody = MyDrone:WaitForChild("Body", 7) -- Or MyDrone.PrimaryPart
+	MyDroneBody = MyDrone:WaitForChild("Body", 7) 
 
 	if not MyDroneBody then
 		warn("MainController: Player drone '", expectedDroneName, "' found, but 'Body' part did NOT appear. Drone might not be fully spawned or configured correctly.")
@@ -106,13 +138,7 @@ local function findPlayerDroneAndInitialize()
 		myGazeboDroneName = "drone_p_fallback_"..player.UserId
 	end
 	print("MainController: Gazebo Ref for drone '", MyDrone.Name, "':", myGazeboDroneName)
-
-	-- Client no longer initializes its own CustomFlightModel for physics
-	-- flightModelInstance = CustomFlightModel.new(MyDrone)
-	-- if not flightModelInstance then ... return end
-	-- print("MainController: CustomFlightModel instance created (client-side, for state reading if needed).")
-
-    -- TrickGuidanceController:Initialize no longer takes flightModelInstance
+    
 	TrickGuidanceController:Initialize(MyDrone)
 	print("MainController: TrickGuidanceController initialized for '", MyDrone.Name, "'.")
 
@@ -122,16 +148,20 @@ local function findPlayerDroneAndInitialize()
 	if inputControllerRef then
 		inputControllerRef:Initialize()
 		inputControllerRef.TrickButtonPressed.Event:Connect(function(trickType, direction)
-			if currentMode ~= "PlayerControl" or not MyDrone or not myGazeboDroneName or myGazeboDroneName == "" then return end
+            print("MainController: TrickButtonPressed.Event received - Type:", trickType, "Direction:", direction, "CurrentMode:", currentMode)
+
+			if (currentMode :: any) ~= "PlayerControl" or not MyDrone or not MyDroneBody or not myGazeboDroneName or myGazeboDroneName == "" then 
+                warn("MainController: TrickButtonPressed.Event - Conditions not met. Mode:", currentMode, "MyDrone:", MyDrone, "MyDroneBody:", MyDroneBody, "GazeboName:", myGazeboDroneName)
+                return 
+            end
 			print("MainController: Trick button pressed - ", trickType, direction, "for drone '"..MyDrone.Name.."'")
 			
-            currentMode = "TrickMode"
-            -- Client no longer directly tells CFM to stop player control. Server will handle this.
-            -- if flightModelInstance then flightModelInstance:SetPlayerControl(false) end
+            currentMode = "TrickMode" 
 
-			local currentState = getDroneCurrentState(MyDrone) -- Use helper to get state from model
+			local currentState = getDroneCurrentState(MyDrone)
 			local m = currentState.mass_kg
-			local qx, qy, qz, qw = currentState.cframe:ToQuaternion()
+            -- CORRECTED: Use colon for CFrame method call
+			local qx, qy, qz, qw = currentState.cframe:ToQuaternion() 
 			local isp = {
 				pos = {currentState.position.X, currentState.position.Y, currentState.position.Z},
 				orient = {qx, qy, qz, qw},
@@ -139,14 +169,61 @@ local function findPlayerDroneAndInitialize()
 				ang_vel = {currentState.angular_velocity.X, currentState.angular_velocity.Y, currentState.angular_velocity.Z},
 				mass_kg = m
 			}
-			currentOriginalRequestId = ClientToServerBridge:RequestTrick({drone_name=myGazeboDroneName,trick_type=trickType,direction=direction,initial_state=isp})
+            
+            local newRequestId = HttpService:GenerateGUID(false)
+			currentOriginalRequestId = newRequestId 
 
-			if not currentOriginalRequestId then
-				warn("MainController: RequestTrick failed for '"..MyDrone.Name.."'. Reverting.")
+            if trickRequestTimeoutTask then
+                task.cancel(trickRequestTimeoutTask)
+                trickRequestTimeoutTask = nil
+            end
+
+			print("MainController: Requesting trick from server. Original Request ID:", currentOriginalRequestId)
+			local bridgeForwardSuccessId = ClientToServerBridge:RequestTrick({
+                original_request_id = currentOriginalRequestId, 
+                drone_name=myGazeboDroneName,
+                trick_type=trickType,
+                direction=direction,
+                initial_state=isp
+            })
+
+			if not bridgeForwardSuccessId then
+				warn("MainController: ClientToServerBridge:RequestTrick returned failure for ID '"..currentOriginalRequestId.."'. Reverting to PlayerControl.")
 				currentMode="PlayerControl"
-                -- if flightModelInstance then flightModelInstance:SetPlayerControl(true) end
+                currentOriginalRequestId = nil
 			else
-				print("MainController: Trick requested for '"..MyDrone.Name.."':",currentOriginalRequestId)
+				print("MainController: Trick request forwarded to server for '"..MyDrone.Name.."'. Original Request ID:", currentOriginalRequestId, ". Waiting for TRICK_DATA_START or 1s timeout...")
+                
+                trickRequestTimeoutTask = task.delay(_Config.TRICK_ACTIVATION_DELAY + 0.5, function() 
+                    trickRequestTimeoutTask = nil 
+
+                    if currentOriginalRequestId == newRequestId and (currentMode :: any) == "TrickMode" and not TrickGuidanceController:IsActive() then
+                        warn("MainController: REQUEST_TRICK timed out for ID:", newRequestId, ". Using pre-programmed fallback for", trickType, direction)
+                        
+                        local fallbackFrames = generatePreProgrammedBarrelRoll(currentState.cframe, direction, 2.0, 40) 
+                        local fallbackBurstId = "fallback_" .. HttpService:GenerateGUID(false)
+                        
+                        TrickGuidanceController:StartTrick(fallbackBurstId, {}) 
+                        TrickGuidanceController:AddFrames(fallbackBurstId, fallbackFrames)
+                        print("MainController: Started pre-programmed fallback trick:", fallbackBurstId, "with", #fallbackFrames, "frames.")
+
+                        task.delay(2.0, function()
+                            if TrickGuidanceController:GetCurrentBurstId() == fallbackBurstId then
+                                print("MainController: Ending pre-programmed fallback trick:", fallbackBurstId)
+                                TrickGuidanceController:EndTrick(fallbackBurstId, false) 
+                                if (currentMode :: any) == "TrickMode" and currentOriginalRequestId == newRequestId then 
+                                    currentMode = "PlayerControl"
+                                    currentOriginalRequestId = nil 
+                                    print("MainController: Fallback trick complete. Reverted to PlayerControl.")
+                                end
+                            end
+                        end)
+                    elseif currentOriginalRequestId == newRequestId and (currentMode :: any) == "TrickMode" and TrickGuidanceController:IsActive() then
+                         print("MainController: Timeout for ID", newRequestId, "occurred, but Gazebo trick already started. No fallback needed.")
+                    else
+                         print("MainController: Timeout for ID", newRequestId, "occurred, but state is no longer relevant for fallback (Mode:", currentMode, "IsTGCActive:", TrickGuidanceController:IsActive(), ").")
+                    end
+                end)
 			end
 		end)
 		print("MainController: InputController initialized and connected for '", MyDrone.Name, "'.")
@@ -169,37 +246,65 @@ function MainController:Start(dependencies)
 	print("MainController: Start called for player", player.Name, "- Physics will be SERVER-SIDE.")
 
 	ClientToServerBridge.OnTrickDataStarted.Event:Connect(function(payload)
-		if payload.original_request_id == currentOriginalRequestId and currentMode == "TrickMode" then
+        print("MainController: OnTrickDataStarted received for payload.original_request_id:", payload.original_request_id, "currentOriginalRequestId:", currentOriginalRequestId)
+		
+        if payload.original_request_id == currentOriginalRequestId and (currentMode :: any) == "TrickMode" then
+            if trickRequestTimeoutTask then 
+                print("MainController: Gazebo responded for TRICK_DATA_START. Cancelling fallback timeout task for ID:", currentOriginalRequestId)
+                task.cancel(trickRequestTimeoutTask) 
+                trickRequestTimeoutTask = nil
+            end
+            
+            if TrickGuidanceController:IsActive() and TrickGuidanceController:GetCurrentBurstId() ~= payload.burst_id then
+                if string.sub(TrickGuidanceController:GetCurrentBurstId(), 1, 8) == "fallback" then
+                     print("MainController: Gazebo data arrived LATE for", payload.original_request_id, "while fallback trick", TrickGuidanceController:GetCurrentBurstId(), "was active. Ending fallback.")
+                     TrickGuidanceController:EndTrick(TrickGuidanceController:GetCurrentBurstId(), true) 
+                else
+                    print("MainController: Already in a Gazebo trick", TrickGuidanceController:GetCurrentBurstId(), "but new TRICK_DATA_START arrived for same original_request_id. This might be a duplicate or error.")
+                end
+            end
+
 			TrickGuidanceController:StartTrick(payload.burst_id, {})
-            -- Server now controls if player inputs are applied. Client just signals trick mode.
-		end
+            print("MainController: TRICK_DATA_START processed for Gazebo-guided trick:", payload.burst_id)
+		else
+            warn("MainController: Received TRICK_DATA_START for an unexpected request ID or mode. Payload ID:", payload.original_request_id, "Current ID:", currentOriginalRequestId, "Mode:", currentMode)
+        end
 	end)
 
 	ClientToServerBridge.OnTrickDataChunk.Event:Connect(function(payload)
-		if payload.original_request_id == currentOriginalRequestId and currentMode == "TrickMode" and payload.burst_id == TrickGuidanceController:GetCurrentBurstId() then
+		if payload.original_request_id == currentOriginalRequestId and (currentMode :: any) == "TrickMode" and TrickGuidanceController:IsActive() and payload.burst_id == TrickGuidanceController:GetCurrentBurstId() then
+            if string.sub(TrickGuidanceController:GetCurrentBurstId(), 1, 8) == "fallback" then
+                return
+            end
 			TrickGuidanceController:AddFrames(payload.burst_id, payload.frames)
 		end
 	end)
 
 	ClientToServerBridge.OnTrickDataEnded.Event:Connect(function(payload)
-		if payload.original_request_id == currentOriginalRequestId and currentMode == "TrickMode" and payload.burst_id == TrickGuidanceController:GetCurrentBurstId() then
+		if payload.original_request_id == currentOriginalRequestId and (currentMode :: any) == "TrickMode" and TrickGuidanceController:IsActive() and payload.burst_id == TrickGuidanceController:GetCurrentBurstId() then
+            if string.sub(TrickGuidanceController:GetCurrentBurstId(), 1, 8) == "fallback" then
+                print("MainController: Received TRICK_DATA_END from server while fallback trick was active. Ending fallback early.")
+            end
 			TrickGuidanceController:EndTrick(payload.burst_id)
 			currentMode = "PlayerControl"
 			currentOriginalRequestId = nil
-			-- Server will resume taking player inputs.
-            -- if flightModelInstance then flightModelInstance:SetPlayerControl(true) end
 		end
 	end)
 
 	ClientToServerBridge.OnTrickError.Event:Connect(function(payload)
-		if payload.original_request_id == currentOriginalRequestId and currentMode == "TrickMode" then
+        print("MainController: OnTrickError received for payload.original_request_id:", payload.original_request_id, "currentOriginalRequestId:", currentOriginalRequestId)
+		if payload.original_request_id == currentOriginalRequestId and (currentMode :: any) == "TrickMode" then
+            if trickRequestTimeoutTask then
+                task.cancel(trickRequestTimeoutTask)
+                trickRequestTimeoutTask = nil
+                print("MainController: OnTrickError - Cancelled pending fallback timeout.")
+            end
 			if TrickGuidanceController:IsActive() then
-				TrickGuidanceController:EndTrick(TrickGuidanceController:GetCurrentBurstId(), true)
+				TrickGuidanceController:EndTrick(TrickGuidanceController:GetCurrentBurstId(), true) 
 			end
 			currentMode = "PlayerControl"
 			currentOriginalRequestId = nil
-            -- Server will resume taking player inputs.
-			-- if flightModelInstance then flightModelInstance:SetPlayerControl(true) end
+            warn("MainController: TrickError received from server:", payload.message, ". Reverted to PlayerControl.")
 		end
 	end)
 
@@ -231,19 +336,14 @@ function MainController:Start(dependencies)
 			return
 		end
 
-        -- Client no longer checks for anchoring to skip physics, server handles that.
-		-- if MyDrone.PrimaryPart and MyDrone.PrimaryPart.Anchored then ... return end
-
-		if currentMode == "PlayerControl" then
+		if (currentMode :: any) == "PlayerControl" then
 			if inputControllerRef and ClientToServerBridge then
 				local inputs = inputControllerRef:GetInputs()
-				ClientToServerBridge:SendDroneInputs(inputs) -- Send inputs to server
-                -- DO NOT CALL: flightModelInstance:Update(deltaTime, inputs.throttle, inputs.roll, inputs.pitch, inputs.yaw)
+				ClientToServerBridge:SendDroneInputs(inputs) 
 			else
 				if doLog then print("Heartbeat: inputControllerRef or ClientToServerBridge MISSING") end
 			end
             
-            -- Log current state read from replicated drone
             if doLog then
                 local droneCurrentState = getDroneCurrentState(MyDrone)
                  print(string.format("HeartbeatClient[%s]: Mode:%s Pos(%.1f,%.1f,%.1f) LinVel(%.1f,%.1f,%.1f) AngVel(%.1f,%.1f,%.1f) Tilt:%.0f Stab:%s (%s)",
@@ -258,19 +358,20 @@ function MainController:Start(dependencies)
                 ))
             end
 
-		elseif currentMode == "TrickMode" then
-            -- TrickGuidanceController:Update on client now does not apply forces directly.
-            -- It might update its internal state or prepare data if it were to send targets to server.
-            -- For now, it's mostly passive on the client side for physics.
+		elseif (currentMode :: any) == "TrickMode" then
 			if TrickGuidanceController:IsActive() then
                 local droneCurrentState = getDroneCurrentState(MyDrone)
 				local guiding = TrickGuidanceController:Update(deltaTime,droneCurrentState.cframe,droneCurrentState.linear_velocity,droneCurrentState.angular_velocity)
 				if not guiding and TrickGuidanceController:IsTrickCompleteOrError() then
-					currentMode="PlayerControl"; currentOriginalRequestId=nil;
-					if doLog then print("MainController: Trick ended or errored (client state), back to PlayerControl.") end
+					currentMode="PlayerControl"; 
+                    if TrickGuidanceController:GetCurrentBurstId() and string.sub(TrickGuidanceController:GetCurrentBurstId(), 1, 8) == "fallback" then
+                        currentOriginalRequestId = nil 
+                    end
+					if doLog then print("MainController: Trick ended or errored (client state for burst", TrickGuidanceController:GetCurrentBurstId(), "), back to PlayerControl.") end
+                    TrickGuidanceController:EndTrick(TrickGuidanceController:GetCurrentBurstId(), TrickGuidanceController:IsTrickCompleteOrError()) 
 				end
 			end
-		elseif currentMode == "AssistanceMode" then
+		elseif (currentMode :: any) == "AssistanceMode" then
 			if doLog then print("MainController: In AssistanceMode (logic pending).") end
 		end
 
@@ -283,7 +384,7 @@ function MainController:Start(dependencies)
 		if droneInitialized and MyDrone and MyDrone.Parent then
 			if DroneViewController then DroneViewController:Update(deltaTime) end
 		elseif DroneViewController then
-			DroneViewController:Update(deltaTime) -- Allow cleanup if drone becomes nil
+			DroneViewController:Update(deltaTime) 
 		end
 	end)
 

@@ -12,15 +12,20 @@ Bridge.OnTrickError = Instance.new("BindableEvent")
 Bridge.OnConfigureDroneAck = Instance.new("BindableEvent")
 
 function Bridge:RequestTrick(payload)
-	payload.original_request_id = HttpService:GenerateGUID(false)
-	print("ClientToServerBridge: Sending RequestTrick:", payload.original_request_id)
+	-- payload.original_request_id is now expected to be set by the caller (MainController)
+	if not payload.original_request_id then 
+        payload.original_request_id = HttpService:GenerateGUID(false)
+        warn("ClientToServerBridge:RequestTrick - original_request_id was not in payload, generated one:", payload.original_request_id)
+    end
+	print("ClientToServerBridge: Sending RequestTrick:", payload.original_request_id, "TrickType:", payload.trick_type)
 	local success, result = pcall(Remotes.RequestTrick.InvokeServer, Remotes.RequestTrick, payload)
 	if success then
 		print("ClientToServerBridge: RequestTrick InvokeServer result:", result)
 		if result and result.success then
-			return payload.original_request_id
+			return payload.original_request_id -- Return the ID on success, as it was successfully forwarded
 		else
-			Bridge.OnTrickError:Fire({ original_request_id = payload.original_request_id, message = result.error or "Failed to forward request."})
+			local errorMsg = (result and result.error) or "Failed to forward request to orchestrator."
+			Bridge.OnTrickError:Fire({ original_request_id = payload.original_request_id, message = errorMsg})
 			return nil
 		end
 	else
